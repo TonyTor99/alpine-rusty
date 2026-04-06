@@ -7,7 +7,7 @@ import re
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -32,6 +32,16 @@ from playwright.async_api import (
 )
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, Playwright, sync_playwright
+
+from bet_intent import BetIntent, parse_bet_intent
+from blogabet_publisher import (
+    BlogabetAuthRequired,
+    BlogabetConfig,
+    BlogabetPublishError,
+    BlogabetPublisher,
+    PublishResult,
+)
+from ocr_client import OcrError, OcrSpaceClient
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -84,6 +94,44 @@ def configure_message_edit_logger() -> logging.Logger:
 message_edit_logger = configure_message_edit_logger()
 
 
+def configure_blogabet_error_logger() -> logging.Logger:
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "blogabet_errors.log"
+
+    max_bytes_raw = (os.getenv("BLOGABET_ERROR_LOG_MAX_BYTES", "1048576") or "").strip()
+    backup_count_raw = (os.getenv("BLOGABET_ERROR_LOG_BACKUP_COUNT", "5") or "").strip()
+    try:
+        max_bytes = max(1024, int(max_bytes_raw))
+    except ValueError:
+        max_bytes = 1048576
+    try:
+        backup_count = max(1, int(backup_count_raw))
+    except ValueError:
+        backup_count = 5
+
+    blogabet_logger = logging.getLogger("alpinbet_parser.blogabet_errors")
+    blogabet_logger.setLevel(logging.INFO)
+    blogabet_logger.propagate = False
+
+    if not blogabet_logger.handlers:
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        blogabet_logger.addHandler(file_handler)
+
+    return blogabet_logger
+
+
+blogabet_error_logger = configure_blogabet_error_logger()
+
+
 def log_message_edit_info(message: str, *args: Any) -> None:
     logger.info(message, *args)
     message_edit_logger.info(message, *args)
@@ -92,6 +140,16 @@ def log_message_edit_info(message: str, *args: Any) -> None:
 def log_message_edit_exception(message: str, *args: Any) -> None:
     logger.exception(message, *args)
     message_edit_logger.exception(message, *args)
+
+
+def log_blogabet_error(message: str, *args: Any) -> None:
+    logger.error(message, *args)
+    blogabet_error_logger.error(message, *args)
+
+
+def log_blogabet_exception(message: str, *args: Any) -> None:
+    logger.exception(message, *args)
+    blogabet_error_logger.exception(message, *args)
 
 DEFAULT_PARSER_URL = "https://alpinbet.com/dispatch/id1631660353/pbd-1-fon"
 DEFAULT_PARSE_ITEM_SELECTOR = ".rTableLine"
@@ -109,6 +167,8 @@ ACTIVE_MATCH_IMAGE_RETRY_WAIT_MS = 1200
 PARSER_SOURCES_STORAGE_FILENAME = "parser_sources.json"
 DEFAULT_MATCH_DATABASE_URL = "sqlite:///parser_matches.db"
 MAX_PENDING_SETTLEMENT_CANDIDATES = 500
+DEFAULT_BLOGABET_STORAGE_STATE_PATH = "./blogabet_state.json"
+DEFAULT_BLOGABET_STAKE = 3
 
 
 @dataclass
@@ -325,6 +385,12 @@ class BrowserState:
         self.vk_chat_lookup_loaded: bool = False
         self.vk_chat_lookup_limit: int = 200
         self.vk_chat_lookup_last_at: str = ""
+        self.blogabet_test_log: str = ""
+        self.blogabet_test_pick_url: str = ""
+        self.blogabet_test_screenshot_path: str = ""
+        self.blogabet_test_html_dump_path: str = ""
+        self.blogabet_test_diagnostics: str = ""
+        self.blogabet_ocr_log: str = ""
 
     def clear_runtime(self) -> None:
         with self.lock:
@@ -406,6 +472,12 @@ class BrowserState:
             self.vk_chat_lookup_loaded = False
             self.vk_chat_lookup_limit = 200
             self.vk_chat_lookup_last_at = ""
+            self.blogabet_test_log = ""
+            self.blogabet_test_pick_url = ""
+            self.blogabet_test_screenshot_path = ""
+            self.blogabet_test_html_dump_path = ""
+            self.blogabet_test_diagnostics = ""
+            self.blogabet_ocr_log = ""
 
 
 state = BrowserState()
@@ -736,6 +808,17 @@ def iter_source_delivery_targets(source: ParserSource) -> list[tuple[str, str]]:
     return targets
 
 
+def iter_source_match_delivery_targets(
+    source: ParserSource,
+    *,
+    include_blogabet: bool,
+) -> list[tuple[str, str]]:
+    targets = iter_source_delivery_targets(source)
+    if include_blogabet:
+        targets.append(("blogabet", "default"))
+    return targets
+
+
 def build_stats_target_key(
     source_id: str,
     stats_kind: str,
@@ -751,7 +834,13 @@ def build_stats_target_key(
 
 
 def stats_target_label(target_kind: str) -> str:
-    return "Telegram" if target_kind == "telegram" else "VK"
+    if target_kind == "telegram":
+        return "Telegram"
+    if target_kind == "vk":
+        return "VK"
+    if target_kind == "blogabet":
+        return "Blogabet"
+    return target_kind
 
 
 def build_vk_plain_text_from_html(message_html: str) -> str:
@@ -1367,6 +1456,96 @@ class MatchTrackingStore:
                 match_lookup_key,
                 match.home_team,
                 match.away_team,
+                event_at,
+                event_at,
+            ),
+        )
+
+    def upsert_failed_delivery(
+        self,
+        source: ParserSource,
+        match: ParsedMatch,
+        target_kind: str,
+        target_chat_id: str,
+        delivery_key: str,
+        error_text: str,
+        event_at: str,
+    ) -> None:
+        signature = compose_match_signature(
+            match.home_team,
+            match.away_team,
+            match.tournament,
+            match.rate,
+            match.rate_description,
+        )
+        match_href = normalize_text(match.href) or source.url
+        match_lookup_key = build_match_lookup_key(match_href)
+        normalized_error = normalize_text(error_text)
+
+        query = """
+            INSERT INTO tracked_match_deliveries (
+                delivery_key,
+                source_id,
+                source_url,
+                match_unique_key,
+                target_kind,
+                target_chat_id,
+                message_id,
+                message_text,
+                match_signature,
+                match_href,
+                match_lookup_key,
+                home_team,
+                away_team,
+                delivery_status,
+                settled,
+                settlement_status,
+                settlement_profit_units,
+                settlement_score,
+                settlement_updated_at,
+                settlement_error,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'failed', 1, '', 0, '', '', ?, ?, ?)
+            ON CONFLICT(delivery_key) DO UPDATE SET
+                source_id = excluded.source_id,
+                source_url = excluded.source_url,
+                match_unique_key = excluded.match_unique_key,
+                target_kind = excluded.target_kind,
+                target_chat_id = excluded.target_chat_id,
+                message_id = 0,
+                message_text = excluded.message_text,
+                match_signature = excluded.match_signature,
+                match_href = excluded.match_href,
+                match_lookup_key = excluded.match_lookup_key,
+                home_team = excluded.home_team,
+                away_team = excluded.away_team,
+                delivery_status = 'failed',
+                settled = 1,
+                settlement_status = '',
+                settlement_profit_units = 0,
+                settlement_score = '',
+                settlement_updated_at = '',
+                settlement_error = excluded.settlement_error,
+                updated_at = excluded.updated_at
+        """
+        self._execute_write(
+            query,
+            (
+                delivery_key,
+                source.source_id,
+                source.url,
+                match.unique_key,
+                target_kind,
+                target_chat_id,
+                normalized_error,
+                signature,
+                match_href,
+                match_lookup_key,
+                match.home_team,
+                match.away_team,
+                normalized_error,
                 event_at,
                 event_at,
             ),
@@ -2154,6 +2333,88 @@ def load_vk_config() -> VkConfig:
     )
 
 
+def resolve_local_path(raw_path: str, default_path: str) -> str:
+    value = normalize_text(raw_path) or default_path
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return str(path)
+
+
+def load_blogabet_config() -> BlogabetConfig:
+    load_dotenv()
+
+    enabled = parse_bool_env(os.getenv("BLOGABET_ENABLED", "0"), default=False)
+    storage_state_path = resolve_local_path(
+        os.getenv("BLOGABET_STORAGE_STATE_PATH", DEFAULT_BLOGABET_STORAGE_STATE_PATH),
+        DEFAULT_BLOGABET_STORAGE_STATE_PATH,
+    )
+    headless = parse_bool_env(os.getenv("BLOGABET_HEADLESS", "1"), default=True)
+
+    stake_raw = normalize_text(os.getenv("BLOGABET_DEFAULT_STAKE", str(DEFAULT_BLOGABET_STAKE)))
+    try:
+        default_stake = int(stake_raw)
+    except ValueError as exc:
+        raise ValueError("BLOGABET_DEFAULT_STAKE должен быть целым числом") from exc
+    if default_stake < 1 or default_stake > 10:
+        raise ValueError("BLOGABET_DEFAULT_STAKE должен быть в диапазоне 1..10")
+
+    interactive_timeout_raw = normalize_text(
+        os.getenv("BLOGABET_INTERACTIVE_LOGIN_TIMEOUT_SECONDS", "600")
+    )
+    try:
+        interactive_login_timeout_seconds = int(interactive_timeout_raw)
+    except ValueError as exc:
+        raise ValueError(
+            "BLOGABET_INTERACTIVE_LOGIN_TIMEOUT_SECONDS должен быть целым числом"
+        ) from exc
+    if interactive_login_timeout_seconds < 60:
+        interactive_login_timeout_seconds = 60
+
+    return BlogabetConfig(
+        enabled=enabled,
+        storage_state_path=storage_state_path,
+        headless=headless,
+        default_stake=default_stake,
+        admin_tg_chat_id=normalize_text(os.getenv("BLOGABET_ADMIN_TG_CHAT_ID", "")),
+        upcoming_url=normalize_text(
+            os.getenv("BLOGABET_UPCOMING_URL", "https://blogabet.com/pinnacle/live")
+        ) or "https://blogabet.com/pinnacle/live",
+        login_url=normalize_text(os.getenv("BLOGABET_LOGIN_URL", "https://blogabet.com"))
+        or "https://blogabet.com",
+        interactive_login_timeout_seconds=interactive_login_timeout_seconds,
+        login_email=(os.getenv("BLOGABET_LOGIN_EMAIL", "") or "").strip(),
+        login_password=os.getenv("BLOGABET_LOGIN_PASSWORD", "") or "",
+    )
+
+
+def load_ocr_client() -> OcrSpaceClient:
+    load_dotenv()
+
+    api_key = normalize_text(os.getenv("OCR_SPACE_API_KEY", ""))
+    if not api_key:
+        raise ValueError("Не задан OCR_SPACE_API_KEY в .env")
+
+    timeout_raw = normalize_text(os.getenv("OCR_SPACE_TIMEOUT_SECONDS", "30"))
+    try:
+        timeout_seconds = int(timeout_raw)
+    except ValueError as exc:
+        raise ValueError("OCR_SPACE_TIMEOUT_SECONDS должен быть целым числом") from exc
+    if timeout_seconds <= 0:
+        raise ValueError("OCR_SPACE_TIMEOUT_SECONDS должен быть больше 0")
+
+    return OcrSpaceClient(
+        api_key=api_key,
+        cache_path=normalize_text(os.getenv("OCR_CACHE_PATH", "./ocr_cache.json"))
+        or "./ocr_cache.json",
+        request_timeout_seconds=timeout_seconds,
+        use_system_proxy=parse_bool_env(
+            os.getenv("OCR_USE_SYSTEM_PROXY", "0"),
+            default=False,
+        ),
+    )
+
+
 def build_active_match_message(match: ParsedMatch, source_url: str) -> str:
     sport_emoji, sport_label = detect_match_sport(match)
     tournament = match.tournament or "Турнир не указан"
@@ -2201,6 +2462,46 @@ def build_active_match_message_html(match: ParsedMatch, source_url: str) -> str:
         "------------------------------\n"
         f"📈 Коэффициент: {html.escape(rate, quote=False)}\n"
         f"{link_line}"
+    )
+
+
+def build_blogabet_analysis_text(
+    match: ParsedMatch,
+    bet_intent: BetIntent,
+    ocr_text: str,
+) -> str:
+    lines = [
+        f"Match: {match.home_team} - {match.away_team}",
+        f"Tournament: {match.tournament}",
+        f"Market: {bet_intent.market}",
+        f"Period: {bet_intent.period}",
+        f"Side: {bet_intent.side}",
+        f"Line: {bet_intent.line if bet_intent.line is not None else '-'}",
+        f"Metric: {bet_intent.metric}",
+    ]
+    raw = normalize_text(ocr_text)
+    if raw:
+        lines.append(f"OCR: {raw[:320]}")
+    return "\n".join(lines)
+
+
+def build_blogabet_admin_alert_message(
+    match: ParsedMatch,
+    bet_raw_text: str,
+    error_text: str,
+) -> str:
+    tournament = normalize_text(match.tournament) or "-"
+    teams = f"{normalize_text(match.home_team)} - {normalize_text(match.away_team)}"
+    bet_text = normalize_text(bet_raw_text) or "-"
+    match_link = normalize_text(match.href) or "-"
+    reason = normalize_text(error_text) or "-"
+    return (
+        "⚠️ Не опубликовано в Blogabet\n"
+        f"Турнир: {tournament}\n"
+        f"Матч: {teams}\n"
+        f"Ставка: {bet_text}\n"
+        f"Ссылка: {match_link}\n"
+        f"Причина: {reason}"
     )
 
 
@@ -4721,24 +5022,24 @@ async def fetch_matches_for_source(
                     needs_navigation = False
 
         if needs_navigation:
-            if source_runtime is not None:
-                if mode == "rotate":
-                    logger.info(
-                        "Пересоздаю страницу источника по TTL. source=%s age=%.1fs ttl=%ss",
-                        source.url,
-                        page_age_seconds,
-                        parser_page_max_age_seconds,
-                    )
-                try:
-                    await source_runtime.page.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            source_runtime = SourcePageRuntime(
-                page=await parser_context.new_page(),
-                created_at_monotonic=time.monotonic(),
-                last_match_count=previous_match_count,
+            reopen_required = (
+                source_runtime is None
+                or source_runtime.page.is_closed()
             )
-            source_pages[source.source_id] = source_runtime
+            if reopen_required:
+                source_runtime = SourcePageRuntime(
+                    page=await parser_context.new_page(),
+                    created_at_monotonic=time.monotonic(),
+                    last_match_count=previous_match_count,
+                )
+                source_pages[source.source_id] = source_runtime
+            elif mode == "rotate":
+                logger.info(
+                    "Перезагружаю страницу источника по TTL. source=%s age=%.1fs ttl=%ss",
+                    source.url,
+                    page_age_seconds,
+                    parser_page_max_age_seconds,
+                )
 
         if source_runtime is None:
             raise RuntimeError("Не удалось открыть страницу источника")
@@ -4749,6 +5050,8 @@ async def fetch_matches_for_source(
             source.url,
             navigate=needs_navigation,
         )
+        if needs_navigation:
+            source_runtime.created_at_monotonic = time.monotonic()
 
         if (
             mode == "live"
@@ -4760,24 +5063,38 @@ async def fetch_matches_for_source(
                 source.url,
                 previous_match_count,
             )
-            try:
-                await source_runtime.page.close()
-            except Exception:  # noqa: BLE001
-                pass
-
-            source_runtime = SourcePageRuntime(
-                page=await parser_context.new_page(),
-                created_at_monotonic=time.monotonic(),
-                last_match_count=previous_match_count,
-            )
-            source_pages[source.source_id] = source_runtime
             source_matches = await fetch_active_matches(
                 source_runtime.page,
                 cfg,
                 source.url,
                 navigate=True,
             )
+            source_runtime.created_at_monotonic = time.monotonic()
             mode = "recovery"
+            if not source_matches:
+                logger.warning(
+                    "Recovery через reload не вернул матчи, пересоздаю вкладку источника. source=%s",
+                    source.url,
+                )
+                try:
+                    await source_runtime.page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+                source_runtime = SourcePageRuntime(
+                    page=await parser_context.new_page(),
+                    created_at_monotonic=time.monotonic(),
+                    last_match_count=previous_match_count,
+                )
+                source_pages[source.source_id] = source_runtime
+                source_matches = await fetch_active_matches(
+                    source_runtime.page,
+                    cfg,
+                    source.url,
+                    navigate=True,
+                )
+                source_runtime.created_at_monotonic = time.monotonic()
+                mode = "recovery_reopen"
 
         source_runtime.last_match_count = len(source_matches)
         logger.info(
@@ -4815,6 +5132,9 @@ async def deliver_match_notification(
     tg_cfg: TelegramConfig,
     vk_session: Optional[aiohttp.ClientSession],
     vk_cfg: Optional[VkConfig],
+    blogabet_publisher: Optional[BlogabetPublisher],
+    blogabet_cfg: Optional[BlogabetConfig],
+    ocr_client: Optional[OcrSpaceClient],
     match_store: MatchTrackingStore,
     match: ParsedMatch,
     source: ParserSource,
@@ -4824,7 +5144,9 @@ async def deliver_match_notification(
 ) -> None:
     message = build_active_match_message(match, source.url)
     telegram_message_html = build_active_match_message_html(match, source.url)
-    platform_label = "Telegram" if target_kind == "telegram" else "VK"
+    platform_label = stats_target_label(target_kind)
+    blogabet_bet_raw = match.rate_description
+    stored_message_text = message
 
     try:
         if target_kind == "telegram":
@@ -4839,6 +5161,7 @@ async def deliver_match_notification(
                 parse_mode="HTML",
                 require_photo=True,
             )
+            stored_message_text = message
         elif target_kind == "vk":
             if vk_session is None or vk_cfg is None:
                 raise RuntimeError("VK конфигурация не загружена")
@@ -4848,6 +5171,45 @@ async def deliver_match_notification(
                 target_chat_id,
                 message,
                 image_url=match.image_url,
+            )
+            stored_message_text = message
+        elif target_kind == "blogabet":
+            if blogabet_cfg is None or blogabet_publisher is None:
+                raise RuntimeError("Blogabet конфигурация не загружена")
+            if ocr_client is None:
+                raise RuntimeError("OCR клиент не инициализирован")
+            if not normalize_text(match.image_url):
+                raise RuntimeError("У матча отсутствует изображение для OCR")
+
+            image_bytes, content_type = await download_image_bytes(tg_session, match.image_url)
+            ocr_text = await ocr_client.recognize_text_from_image_bytes(
+                image_bytes,
+                content_type,
+                cache_key=normalize_text(match.image_url) or None,
+            )
+            bet_intent = parse_bet_intent(ocr_text)
+            blogabet_bet_raw = bet_intent.raw_text
+            analysis_text = build_blogabet_analysis_text(match, bet_intent, ocr_text)
+            publish_result = await blogabet_publisher.publish_pick(
+                match,
+                bet_intent,
+                blogabet_cfg.default_stake,
+                analysis_text,
+                diagnostics_context={
+                    "ocr_text": ocr_text,
+                    "match_href": match.href,
+                    "source_url": source.url,
+                },
+            )
+
+            if not publish_result.success:
+                raise RuntimeError("Blogabet вернул неуспешный результат публикации")
+
+            pick_id = publish_result.pick_id or 0
+            pick_url = normalize_text(publish_result.pick_url or "")
+            message_id = pick_id
+            stored_message_text = pick_url or (
+                f"Blogabet pick for {match.home_team} - {match.away_team}"
             )
         else:
             raise RuntimeError(f"Неизвестный тип канала доставки: {target_kind}")
@@ -4868,28 +5230,74 @@ async def deliver_match_notification(
             target_chat_id,
             delivery_key,
             message_id,
-            message,
+            stored_message_text,
             now_storage_label_msk(),
         )
         with state.lock:
-            state.preview = message + (
+            state.preview = stored_message_text + (
                 f"\nВложение: {match.image_url}" if match.image_url else ""
             ) + f"\nПлатформа: {platform_label}\nЧат: {target_chat_id}"
-            state.last_message_id = message_id
+            state.last_message_id = message_id if message_id > 0 else state.last_message_id
             state.parser_last_sent_at = now_label()
             state.parser_last_match_title = f"{match.home_team} - {match.away_team}"
     except Exception as exc:  # noqa: BLE001
-        logger.exception(
-            "Ошибка отправки уведомления. platform=%s match=%s source=%s chat_id=%s",
-            platform_label,
-            match.unique_key,
-            source.url,
-            target_chat_id,
-        )
+        error_details = humanize_parser_error(exc)
+        if isinstance(exc, BlogabetPublishError):
+            error_details = f"{exc.step_name}: {exc.reason}"
+
+        if target_kind == "blogabet":
+            log_blogabet_exception(
+                "Ошибка отправки уведомления Blogabet. platform=%s match=%s source=%s chat_id=%s error=%s",
+                platform_label,
+                match.unique_key,
+                source.url,
+                target_chat_id,
+                error_details,
+            )
+        else:
+            logger.exception(
+                "Ошибка отправки уведомления. platform=%s match=%s source=%s chat_id=%s",
+                platform_label,
+                match.unique_key,
+                source.url,
+                target_chat_id,
+            )
+
+        if target_kind == "blogabet":
+            try:
+                match_store.upsert_failed_delivery(
+                    source,
+                    match,
+                    target_kind,
+                    target_chat_id,
+                    delivery_key,
+                    error_details,
+                    now_storage_label_msk(),
+                )
+            except Exception:  # noqa: BLE001
+                log_blogabet_exception("Не удалось сохранить failed-доставку Blogabet в БД")
+
+            admin_chat_id = normalize_text(blogabet_cfg.admin_tg_chat_id if blogabet_cfg else "")
+            if admin_chat_id:
+                try:
+                    alert_message = build_blogabet_admin_alert_message(
+                        match,
+                        blogabet_bet_raw,
+                        error_details,
+                    )
+                    await send_telegram_match_message(
+                        tg_session,
+                        tg_cfg,
+                        admin_chat_id,
+                        alert_message,
+                    )
+                except Exception:  # noqa: BLE001
+                    log_blogabet_exception("Не удалось отправить алерт админу о сбое Blogabet")
+
         with state.lock:
             state.parser_error = (
                 f"{now_label()} | Ошибка отправки в {platform_label} ({target_chat_id}): "
-                f"{humanize_parser_error(exc)}"
+                f"{error_details}"
             )
     finally:
         with state.lock:
@@ -5077,6 +5485,8 @@ async def schedule_settlement_updates_for_source(
     source: ParserSource,
     active_matches: tuple[ParsedMatch, ...],
     settlement_tasks: set[asyncio.Task[None]],
+    completed_fetch_last_at: dict[str, float],
+    completed_fetch_interval_seconds: int,
 ) -> int:
     active_match_keys = {
         match.unique_key
@@ -5090,6 +5500,10 @@ async def schedule_settlement_updates_for_source(
     candidates = reserve_settlement_candidates(match_store, source.source_id)
     has_disappeared = match_store.has_disappeared_matches(source.source_id)
     should_check_completed_now = disappeared_count > 0
+    now_monotonic = time.monotonic()
+    interval_seconds = max(completed_fetch_interval_seconds, 10)
+    last_completed_fetch_at = completed_fetch_last_at.get(source.source_id, 0.0)
+    completed_fetch_due = (now_monotonic - last_completed_fetch_at) >= interval_seconds
 
     if should_check_completed_now:
         logger.info(
@@ -5101,6 +5515,10 @@ async def schedule_settlement_updates_for_source(
     if not candidates and not has_disappeared and not should_check_completed_now:
         return 0
 
+    if not should_check_completed_now and not completed_fetch_due:
+        release_pending_settlement_keys([record.delivery_key for record in candidates])
+        return 0
+
     completed_page: Optional[AsyncPage] = None
     try:
         completed_page = await parser_context.new_page()
@@ -5110,7 +5528,9 @@ async def schedule_settlement_updates_for_source(
             source.url,
             navigate=True,
         )
+        completed_fetch_last_at[source.source_id] = time.monotonic()
     except Exception:
+        completed_fetch_last_at[source.source_id] = time.monotonic()
         release_pending_settlement_keys([record.delivery_key for record in candidates])
         raise
     finally:
@@ -5832,6 +6252,43 @@ async def parser_worker_async(
     except Exception as exc:  # noqa: BLE001
         vk_cfg = None
         logger.warning("VK конфигурация недоступна: %s", exc)
+
+    blogabet_requested = parse_bool_env(os.getenv("BLOGABET_ENABLED", "0"), default=False)
+    blogabet_cfg: Optional[BlogabetConfig] = None
+    ocr_client: Optional[OcrSpaceClient] = None
+    try:
+        candidate_blogabet_cfg = load_blogabet_config()
+        if candidate_blogabet_cfg.enabled:
+            blogabet_cfg = candidate_blogabet_cfg
+            ocr_client = load_ocr_client()
+            logger.info(
+                "Blogabet доставка включена. storage_state=%s headless=%s stake=%s upcoming_url=%s",
+                blogabet_cfg.storage_state_path,
+                blogabet_cfg.headless,
+                blogabet_cfg.default_stake,
+                blogabet_cfg.upcoming_url,
+            )
+            if not normalize_text(blogabet_cfg.admin_tg_chat_id):
+                logger.warning(
+                    "BLOGABET_ENABLED=1, но BLOGABET_ADMIN_TG_CHAT_ID пуст: admin-уведомления о сбоях Blogabet не будут отправляться"
+                )
+            if not Path(blogabet_cfg.storage_state_path).exists():
+                logger.warning(
+                    "BLOGABET_ENABLED=1, но storage_state не найден: %s",
+                    blogabet_cfg.storage_state_path,
+                )
+    except Exception as exc:  # noqa: BLE001
+        blogabet_cfg = None
+        ocr_client = None
+        if blogabet_requested:
+            log_blogabet_error("BLOGABET_ENABLED=1, но Blogabet/OCR конфигурация недоступна: %s", exc)
+            with state.lock:
+                state.parser_error = (
+                    f"{now_label()} | Blogabet/OCR конфигурация недоступна: {humanize_parser_error(exc)}"
+                )
+        else:
+            logger.warning("Blogabet/OCR конфигурация недоступна: %s", exc)
+
     try:
         match_store = get_match_store()
     except Exception as exc:  # noqa: BLE001
@@ -5846,15 +6303,19 @@ async def parser_worker_async(
     parser_browser: Optional[Any] = None
     parser_context: Optional[Any] = None
     source_pages: dict[str, SourcePageRuntime] = {}
+    settlement_completed_fetch_last_at: dict[str, float] = {}
     source_bootstrapped: set[str] = set()
     delivery_tasks: set[asyncio.Task[None]] = set()
     settlement_tasks: set[asyncio.Task[None]] = set()
+    blogabet_publisher: Optional[BlogabetPublisher] = None
 
     try:
         parser_playwright = await async_playwright().start()
         parser_browser = await parser_playwright.chromium.launch(headless=cfg.headless)
         parser_context = await parser_browser.new_context(storage_state=storage_state)
         logger.info("Браузер парсера успешно инициализирован")
+        if blogabet_cfg is not None and ocr_client is not None:
+            blogabet_publisher = BlogabetPublisher(blogabet_cfg, logger=logger)
 
         tg_timeout = aiohttp.ClientTimeout(total=tg_cfg.request_timeout_seconds)
         async with aiohttp.ClientSession(
@@ -5911,6 +6372,7 @@ async def parser_worker_async(
                             except Exception:  # noqa: BLE001
                                 pass
                             source_bootstrapped.discard(source_id)
+                            settlement_completed_fetch_last_at.pop(source_id, None)
 
                         if not enabled_sources:
                             with state.lock:
@@ -5986,7 +6448,10 @@ async def parser_worker_async(
                                         )
                                         try:
                                             for match in result.matches:
-                                                for target_kind, target_chat_id in iter_source_delivery_targets(source):
+                                                for target_kind, target_chat_id in iter_source_match_delivery_targets(
+                                                    source,
+                                                    include_blogabet=blogabet_publisher is not None,
+                                                ):
                                                     if target_kind == "telegram":
                                                         delivery_key = compose_delivery_key(
                                                             source.source_id,
@@ -6021,7 +6486,10 @@ async def parser_worker_async(
 
                                 if not skip_live_notifications:
                                     for match in result.matches:
-                                        for target_kind, target_chat_id in iter_source_delivery_targets(source):
+                                        for target_kind, target_chat_id in iter_source_match_delivery_targets(
+                                            source,
+                                            include_blogabet=blogabet_publisher is not None,
+                                        ):
                                             if target_kind == "telegram":
                                                 delivery_key = compose_delivery_key(
                                                     source.source_id,
@@ -6060,6 +6528,9 @@ async def parser_worker_async(
                                                     tg_cfg,
                                                     vk_session,
                                                     vk_cfg,
+                                                    blogabet_publisher,
+                                                    blogabet_cfg,
+                                                    ocr_client,
                                                     match_store,
                                                     match,
                                                     source,
@@ -6082,6 +6553,8 @@ async def parser_worker_async(
                                             source,
                                             result.matches,
                                             settlement_tasks,
+                                            settlement_completed_fetch_last_at,
+                                            parser_page_max_age_seconds,
                                         )
                                         if settled_updates_scheduled > 0:
                                             logger.info(
@@ -6263,6 +6736,12 @@ async def parser_worker_async(
         if parser_playwright is not None:
             try:
                 await parser_playwright.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+        if blogabet_publisher is not None:
+            try:
+                await blogabet_publisher.close()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -6902,6 +7381,7 @@ TEMPLATE = """
         <a href="#sources">Источники</a>
         <a href="#stats">Статистика</a>
         <a href="#tests">Тесты и сервис</a>
+        <a href="#blogabet">Blogabet</a>
         <a href="#tokens">Токены</a>
         <a href="#vk-peer-ids">VK peer_id</a>
         {% if preview %}<a href="#preview">Последнее сообщение</a>{% endif %}
@@ -7143,6 +7623,88 @@ TEMPLATE = """
         </div>
       </section>
 
+      <section id="blogabet" class="panel">
+        <div class="panel-head">
+          <h2>Blogabet</h2>
+        </div>
+        <div class="section-grid">
+          <article class="tile">
+            <h3>Статус и сессия</h3>
+            <div class="hint">Включено: {{ 'Да' if blogabet_enabled else 'Нет' }}</div>
+            <div class="hint">Headless: {{ 'Да' if blogabet_headless else 'Нет' }}</div>
+            <div class="hint">Stake по умолчанию: {{ blogabet_default_stake }}</div>
+            <div class="hint">Storage state: <code>{{ blogabet_storage_state_path }}</code></div>
+            <div class="hint">Файл state: {{ 'найден' if blogabet_storage_state_exists else 'не найден' }}</div>
+            <form method="post" action="{{ url_for('blogabet_login_route') }}">
+              <button class="secondary" type="submit">Login to Blogabet</button>
+            </form>
+            <div class="hint">Если при входе есть CAPTCHA/reCAPTCHA, пройди её вручную в открытом браузере.</div>
+            <div class="hint">Автологин использует BLOGABET_LOGIN_EMAIL и BLOGABET_LOGIN_PASSWORD (если заданы).</div>
+          </article>
+
+          <article class="tile full">
+            <h3>Test publish</h3>
+            <form method="post" action="{{ url_for('blogabet_test_publish_route') }}" enctype="multipart/form-data">
+              <input name="tournament" type="text" placeholder="Tournament" required />
+              <input name="home_team" type="text" placeholder="Home team" required />
+              <input name="away_team" type="text" placeholder="Away team" required />
+              <input name="manual_score" type="text" placeholder="Current score (опционально, для live), например 3:0" />
+              <input name="image_url" type="url" placeholder="Image URL (если не загружаешь файл)" />
+              <input name="image_file" type="file" accept="image/*" />
+              <textarea name="bet_text" placeholder="Bet text (опционально, без OCR), например: 1-я половина&#10;П1"></textarea>
+              <input name="stake" type="number" min="1" max="10" step="1" value="{{ blogabet_default_stake }}" required />
+              <textarea name="analysis_text" placeholder="Analysis (опционально)"></textarea>
+              <label class="checkbox">
+                <input type="checkbox" name="dry_run" value="1" checked /><i></i> Dry run (без Create pick)
+              </label>
+              <div class="source-actions">
+                <button class="secondary mini" type="submit" name="blogabet_action" value="find">Найти матч</button>
+                <button class="mini" type="submit" name="blogabet_action" value="publish">Опубликовать</button>
+              </div>
+            </form>
+            <div class="hint">Поле Analysis (опционально): текст комментария к pick в Blogabet. Если пусто, подставится авто‑analysis из OCR/ставки.</div>
+            <div class="hint">Поле Bet text (опционально): если заполнено, OCR не используется.</div>
+            <div class="hint">Поле Current score: ручной счёт live-матча для теста (формат 3:0 или 3-0), если OCR его не распознал.</div>
+            <div class="hint">Чекбокс Dry run: включает тест без нажатия Create pick (реально не публикует).</div>
+            <div class="hint">Тестовые действия Find/Publish запускаются в видимом браузере (headful).</div>
+            <div class="hint">Используются OCR -> parse_bet_intent -> поиск лиги/матча/рынка в Blogabet Pinnacle Live.</div>
+          </article>
+
+          <article class="tile full">
+            <h3>OCR by URL</h3>
+            <form method="post" action="{{ url_for('blogabet_test_ocr_route') }}" enctype="multipart/form-data">
+              <input name="image_url" type="url" placeholder="Image URL (если не загружаешь файл)" />
+              <input name="image_file" type="file" accept="image/*" />
+              <div class="source-actions">
+                <button class="secondary mini" type="submit">Распознать параметры</button>
+              </div>
+            </form>
+            <div class="hint">Инструмент только для распознавания OCR и разбора Bet intent, без поиска матча и публикации.</div>
+          </article>
+
+          {% if blogabet_test_log %}
+          <article class="tile full">
+            <h3>Результат Test publish</h3>
+            {% if blogabet_test_pick_url %}<div class="hint">Pick URL: {{ blogabet_test_pick_url }}</div>{% endif %}
+            {% if blogabet_test_screenshot_path %}<div class="hint">Screenshot: {{ blogabet_test_screenshot_path }}</div>{% endif %}
+            {% if blogabet_test_html_dump_path %}<div class="hint">HTML dump: {{ blogabet_test_html_dump_path }}</div>{% endif %}
+            <pre>{{ blogabet_test_log }}</pre>
+            {% if blogabet_test_diagnostics %}
+            <div class="hint">Diagnostics:</div>
+            <pre>{{ blogabet_test_diagnostics }}</pre>
+            {% endif %}
+          </article>
+          {% endif %}
+
+          {% if blogabet_ocr_log %}
+          <article class="tile full">
+            <h3>Результат OCR by URL</h3>
+            <pre>{{ blogabet_ocr_log }}</pre>
+          </article>
+          {% endif %}
+        </div>
+      </section>
+
       <section id="tokens" class="panel">
         <div class="panel-head">
           <h2>Токены и интеграции</h2>
@@ -7266,6 +7828,14 @@ TEMPLATE = """
 def index():
     config_error = ""
     match_db_status = ""
+    blogabet_enabled = False
+    blogabet_headless = True
+    blogabet_default_stake = DEFAULT_BLOGABET_STAKE
+    blogabet_storage_state_path = resolve_local_path(
+        DEFAULT_BLOGABET_STORAGE_STATE_PATH,
+        DEFAULT_BLOGABET_STORAGE_STATE_PATH,
+    )
+    blogabet_storage_state_exists = Path(blogabet_storage_state_path).exists()
     default_interval = DEFAULT_PARSER_INTERVAL_SECONDS
     default_parser_page_max_age_seconds = DEFAULT_PARSER_PAGE_MAX_AGE_SECONDS
     default_parser_send_existing_on_start = True
@@ -7291,6 +7861,19 @@ def index():
         ensure_parser_runtime_defaults(cfg)
     except Exception as exc:  # noqa: BLE001
         config_error = str(exc)
+
+    try:
+        blogabet_cfg = load_blogabet_config()
+        blogabet_enabled = blogabet_cfg.enabled
+        blogabet_headless = blogabet_cfg.headless
+        blogabet_default_stake = blogabet_cfg.default_stake
+        blogabet_storage_state_path = blogabet_cfg.storage_state_path
+        blogabet_storage_state_exists = Path(blogabet_storage_state_path).exists()
+    except Exception as exc:  # noqa: BLE001
+        if config_error:
+            config_error = f"{config_error} | Blogabet: {exc}"
+        else:
+            config_error = f"Blogabet: {exc}"
 
     try:
         counters = get_match_store().fetch_status_counters()
@@ -7333,6 +7916,12 @@ def index():
         vk_chat_lookup_loaded = state.vk_chat_lookup_loaded
         vk_chat_lookup_limit = state.vk_chat_lookup_limit
         vk_chat_lookup_last_at = state.vk_chat_lookup_last_at
+        blogabet_test_log = state.blogabet_test_log
+        blogabet_test_pick_url = state.blogabet_test_pick_url
+        blogabet_test_screenshot_path = state.blogabet_test_screenshot_path
+        blogabet_test_html_dump_path = state.blogabet_test_html_dump_path
+        blogabet_test_diagnostics = state.blogabet_test_diagnostics
+        blogabet_ocr_log = state.blogabet_ocr_log
 
         return render_template_string(
             TEMPLATE,
@@ -7372,6 +7961,17 @@ def index():
             vk_chat_lookup_loaded=vk_chat_lookup_loaded,
             vk_chat_lookup_limit=vk_chat_lookup_limit,
             vk_chat_lookup_last_at=vk_chat_lookup_last_at,
+            blogabet_enabled=blogabet_enabled,
+            blogabet_headless=blogabet_headless,
+            blogabet_default_stake=blogabet_default_stake,
+            blogabet_storage_state_path=blogabet_storage_state_path,
+            blogabet_storage_state_exists=blogabet_storage_state_exists,
+            blogabet_test_log=blogabet_test_log,
+            blogabet_test_pick_url=blogabet_test_pick_url,
+            blogabet_test_screenshot_path=blogabet_test_screenshot_path,
+            blogabet_test_html_dump_path=blogabet_test_html_dump_path,
+            blogabet_test_diagnostics=blogabet_test_diagnostics,
+            blogabet_ocr_log=blogabet_ocr_log,
             parser_interval_seconds=parser_interval_seconds,
             parser_page_max_age_seconds=parser_page_max_age_seconds,
             parser_send_existing_on_start=default_parser_send_existing_on_start,
@@ -8441,6 +9041,257 @@ def send_settlement_test():
     except Exception as exc:  # noqa: BLE001
         with state.lock:
             state.error = f"Тест обновления исхода не удался: {exc}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/blogabet-login")
+def blogabet_login_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    try:
+        blogabet_cfg = load_blogabet_config()
+        publisher = BlogabetPublisher(blogabet_cfg, logger=logger)
+
+        async def _login() -> str:
+            try:
+                return await publisher.interactive_login_and_save_state()
+            finally:
+                await publisher.close()
+
+        storage_state_path = asyncio.run(_login())
+        with state.lock:
+            state.info = f"Blogabet login завершен. Storage state сохранен: {storage_state_path}"
+    except Exception as exc:  # noqa: BLE001
+        log_blogabet_exception("Blogabet login не выполнен: %s", humanize_parser_error(exc))
+        with state.lock:
+            state.error = f"Blogabet login не выполнен: {humanize_parser_error(exc)}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/blogabet-test-publish")
+def blogabet_test_publish_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+        state.blogabet_test_log = ""
+        state.blogabet_test_pick_url = ""
+        state.blogabet_test_screenshot_path = ""
+        state.blogabet_test_html_dump_path = ""
+        state.blogabet_test_diagnostics = ""
+
+    tournament = normalize_text(request.form.get("tournament", ""))
+    home_team = normalize_text(request.form.get("home_team", ""))
+    away_team = normalize_text(request.form.get("away_team", ""))
+    manual_score_raw = normalize_text(request.form.get("manual_score", ""))
+    image_url = normalize_text(request.form.get("image_url", ""))
+    manual_bet_text = (request.form.get("bet_text", "") or "").strip()
+    analysis_text = normalize_text(request.form.get("analysis_text", ""))
+    action = normalize_text(request.form.get("blogabet_action", "find")).lower()
+    dry_run_requested = normalize_text(request.form.get("dry_run", "")) in {
+        "1",
+        "on",
+        "true",
+        "yes",
+    }
+    dry_run = action != "publish" or dry_run_requested
+
+    stake_raw = normalize_text(request.form.get("stake", ""))
+    uploaded_image = request.files.get("image_file")
+
+    if not tournament or not home_team or not away_team:
+        with state.lock:
+            state.error = "Нужно заполнить tournament, home_team и away_team"
+        return redirect(url_for("index"))
+
+    manual_score = ""
+    if manual_score_raw:
+        score_match = re.search(r"(\d{1,2})\s*[:\-]\s*(\d{1,2})", manual_score_raw)
+        if score_match is None:
+            with state.lock:
+                state.error = "Current score должен быть в формате 3:0 или 3-0"
+            return redirect(url_for("index"))
+        manual_score = f"{score_match.group(1)}:{score_match.group(2)}"
+
+    try:
+        stake = int(stake_raw or str(DEFAULT_BLOGABET_STAKE))
+    except ValueError:
+        with state.lock:
+            state.error = "Stake должен быть целым числом"
+        return redirect(url_for("index"))
+
+    image_bytes: bytes = b""
+    image_content_type = "image/jpeg"
+    if uploaded_image is not None and normalize_text(uploaded_image.filename):
+        image_bytes = uploaded_image.read()
+        image_content_type = normalize_text(uploaded_image.mimetype) or "image/jpeg"
+
+    if not manual_bet_text and not image_bytes and not image_url:
+        with state.lock:
+            state.error = "Нужен Bet text или image_url/upload изображения"
+        return redirect(url_for("index"))
+
+    try:
+        blogabet_cfg = load_blogabet_config()
+        test_blogabet_cfg = replace(blogabet_cfg, headless=False)
+        ocr_client = load_ocr_client()
+        publisher = BlogabetPublisher(test_blogabet_cfg, logger=logger)
+
+        async def _run_test() -> tuple[str, str, BetIntent, PublishResult]:
+            try:
+                ocr_source = "manual"
+                if manual_bet_text:
+                    ocr_text = manual_bet_text
+                else:
+                    ocr_source = "ocr"
+                    if image_bytes:
+                        ocr_text = await ocr_client.recognize_text_from_image_bytes(
+                            image_bytes,
+                            image_content_type,
+                        )
+                    else:
+                        ocr_text = await ocr_client.recognize_text_from_image_url(image_url)
+
+                bet_intent = parse_bet_intent(ocr_text)
+                if manual_score:
+                    bet_intent = replace(
+                        bet_intent,
+                        current_score=manual_score,
+                        is_live=True,
+                    )
+                manual_match = ParsedMatch(
+                    home_team=home_team,
+                    away_team=away_team,
+                    tournament=tournament,
+                    event_time="",
+                    score=manual_score,
+                    rate="",
+                    rate_description=bet_intent.raw_text,
+                    href=image_url or "manual://uploaded-image",
+                    image_url=image_url or "manual://uploaded-image",
+                    unique_key=f"manual::{tournament}::{home_team}::{away_team}",
+                )
+                result = await publisher.publish_pick(
+                    manual_match,
+                    bet_intent,
+                    stake,
+                    analysis_text or build_blogabet_analysis_text(manual_match, bet_intent, ocr_text),
+                    dry_run=dry_run,
+                    diagnostics_context={"test_action": action},
+                )
+                return ocr_source, ocr_text, bet_intent, result
+            finally:
+                await publisher.close()
+
+        ocr_source, ocr_text, bet_intent, result = asyncio.run(_run_test())
+        diagnostics_text = BlogabetPublisher.format_diagnostics(result.diagnostics)
+        bet_json = json.dumps(bet_intent.__dict__, ensure_ascii=False, indent=2)
+
+        with state.lock:
+            state.blogabet_test_pick_url = normalize_text(result.pick_url or "")
+            state.blogabet_test_diagnostics = diagnostics_text
+            state.blogabet_test_log = (
+                f"Action: {action}\n"
+                f"Dry run: {'yes' if dry_run else 'no'}\n"
+                f"Bet source: {ocr_source}\n"
+                f"Manual score: {manual_score or '-'}\n"
+                f"OCR text:\n{ocr_text}\n\n"
+                f"Bet intent:\n{bet_json}\n\n"
+                f"Publish success: {result.success}\n"
+            )
+            state.info = (
+                "Blogabet test выполнен успешно (dry run)."
+                if dry_run
+                else "Blogabet test publish выполнен успешно."
+            )
+    except BlogabetPublishError as exc:
+        log_blogabet_exception(
+            "Blogabet test publish error: step=%s reason=%s",
+            exc.step_name,
+            exc.reason,
+        )
+        with state.lock:
+            state.blogabet_test_screenshot_path = exc.screenshot_path
+            state.blogabet_test_html_dump_path = exc.html_dump_path
+            state.blogabet_test_diagnostics = BlogabetPublisher.format_diagnostics(exc.diagnostics)
+            state.blogabet_test_log = (
+                f"Step: {exc.step_name}\n"
+                f"Reason: {exc.reason}\n"
+            )
+            state.error = f"Blogabet test не выполнен: {exc.step_name} | {exc.reason}"
+    except OcrError as exc:
+        log_blogabet_exception("Blogabet test OCR error: %s", humanize_parser_error(exc))
+        with state.lock:
+            state.error = (
+                "Blogabet test не выполнен: ошибка OCR. "
+                f"{humanize_parser_error(exc)}. "
+                "Проверь OCR_SPACE_API_KEY или укажи Bet text для теста без OCR."
+            )
+    except Exception as exc:  # noqa: BLE001
+        log_blogabet_exception("Blogabet test publish unexpected error: %s", humanize_parser_error(exc))
+        with state.lock:
+            state.error = f"Blogabet test не выполнен: {humanize_parser_error(exc)}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/blogabet-test-ocr")
+def blogabet_test_ocr_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+        state.blogabet_ocr_log = ""
+
+    image_url = normalize_text(request.form.get("image_url", ""))
+    uploaded_image = request.files.get("image_file")
+    image_bytes: bytes = b""
+    image_content_type = "image/jpeg"
+    if uploaded_image is not None and normalize_text(uploaded_image.filename):
+        image_bytes = uploaded_image.read()
+        image_content_type = normalize_text(uploaded_image.mimetype) or "image/jpeg"
+
+    if not image_url and not image_bytes:
+        with state.lock:
+            state.error = "Нужен Image URL или upload изображения для OCR"
+        return redirect(url_for("index"))
+
+    try:
+        ocr_client = load_ocr_client()
+
+        async def _run_ocr() -> tuple[str, BetIntent, str]:
+            if image_bytes:
+                ocr_text = await ocr_client.recognize_text_from_image_bytes(
+                    image_bytes,
+                    content_type=image_content_type,
+                )
+                source = "upload"
+            else:
+                ocr_text = await ocr_client.recognize_text_from_image_url(image_url)
+                source = "url"
+            bet_intent = parse_bet_intent(ocr_text)
+            return ocr_text, bet_intent, source
+
+        ocr_text, bet_intent, source = asyncio.run(_run_ocr())
+        bet_json = json.dumps(bet_intent.__dict__, ensure_ascii=False, indent=2)
+        with state.lock:
+            state.blogabet_ocr_log = (
+                f"Source: {source}\n"
+                f"Image URL: {image_url or '-'}\n\n"
+                f"OCR text:\n{ocr_text}\n\n"
+                f"Bet intent:\n{bet_json}\n"
+            )
+            state.info = "OCR распознавание выполнено."
+    except OcrError as exc:
+        log_blogabet_exception("Blogabet OCR tool error: %s", humanize_parser_error(exc))
+        with state.lock:
+            state.error = f"OCR не выполнен: {humanize_parser_error(exc)}"
+    except Exception as exc:  # noqa: BLE001
+        log_blogabet_exception("Blogabet OCR tool unexpected error: %s", humanize_parser_error(exc))
+        with state.lock:
+            state.error = f"OCR не выполнен: {humanize_parser_error(exc)}"
 
     return redirect(url_for("index"))
 
