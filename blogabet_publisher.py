@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import inspect
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -35,6 +37,7 @@ class BlogabetConfig:
     headless: bool
     default_stake: int
     admin_tg_chat_id: str
+    league_aliases_path: str = "./blogabet_league_aliases.json"
     upcoming_url: str = "https://blogabet.com/pinnacle/live"
     login_url: str = "https://blogabet.com"
     interactive_login_timeout_seconds: int = 600
@@ -101,13 +104,70 @@ class SELECTORS:
     LOGIN_TRIGGER = (
         "a[data-target='#systemModal'][data-toggle='modal'], "
         "a[href='#systemModal'], "
-        "a.btn.btn-outline:has-text('LOG IN')"
+        "a.btn.btn-outline:has-text('LOG IN'), "
+        "a:has-text('Log in'), "
+        "a:has-text('Login'), "
+        "a:has-text('Sign in'), "
+        "button:has-text('Log in'), "
+        "button:has-text('Sign in')"
     )
     LOGIN_MODAL = "#systemModal"
-    LOGIN_FORM = "form#form-login"
-    LOGIN_EMAIL_INPUT = "input[name='email'], input#email"
-    LOGIN_PASSWORD_INPUT = "input[name='password'], input#password"
-    LOGIN_SUBMIT_BUTTON = "button[type='submit']"
+    LOGIN_FORM = (
+        "form#form-login, "
+        "#systemModal form#form-login, "
+        "form[action*='login'], "
+        "form[action*='signin'], "
+        "#login-form, "
+        "#login-form form"
+    )
+    LOGIN_EMAIL_INPUT = (
+        "input[name='email'], input#email, input[type='email'], "
+        "input[name='username'], input[name='login']"
+    )
+    LOGIN_PASSWORD_INPUT = "input[name='password'], input#password, input[type='password']"
+    LOGIN_SUBMIT_BUTTON = "button[type='submit'], input[type='submit']"
+
+
+_TEAM_LABEL_MARKET_SUFFIXES = ("corners", "corner", "bookings", "booking", "cards", "card")
+_RECOVERABLE_SUBMIT_MARKERS = (
+    "odds dropped",
+    "odds changed",
+    "odds has changed",
+    "odds were changed",
+    "price changed",
+    "price has changed",
+)
+_DEFAULT_LEAGUE_FALLBACK_CANDIDATES = 7
+_PERIOD_TAB_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "full_event": ("Full Event", "Full Time", "Match"),
+    "first_half": ("First Half", "1st Half", "1H"),
+    "second_half": ("Second Half", "2nd Half", "2H"),
+    "team_total": ("Team Total", "Team Totals"),
+}
+
+
+async def _first_visible(locator: Any, *, limit: int = 8) -> Any:
+    total = await locator.count()
+    for index in range(min(total, limit)):
+        node = locator.nth(index)
+        try:
+            if await node.is_visible():
+                return node
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+async def _first_present(locator: Any, *, limit: int = 8) -> Any:
+    total = await locator.count()
+    for index in range(min(total, limit)):
+        node = locator.nth(index)
+        try:
+            if await node.count() > 0:
+                return node
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def _extract_float(value: str) -> Optional[float]:
@@ -135,7 +195,24 @@ def _extract_float(value: str) -> Optional[float]:
 def _clean_team_label(value: str) -> str:
     text = normalize(value)
     text = re.sub(r"^(h|a|d)\s+", "", text, flags=re.IGNORECASE)
+    text = _strip_team_market_suffix(text)
     return text.strip()
+
+
+def _strip_team_market_suffix(value: str) -> str:
+    text = normalize(value)
+    if not text:
+        return ""
+
+    # Удаляем только хвостовые market-суффиксы, чтобы не ломать реальные имена клубов.
+    suffix_pattern = "|".join(re.escape(token) for token in _TEAM_LABEL_MARKET_SUFFIXES)
+    pattern = re.compile(rf"(?:^|\s)(?:{suffix_pattern})$")
+    while True:
+        updated = pattern.sub("", text).strip()
+        if updated == text:
+            break
+        text = normalize(updated)
+    return normalize(text)
 
 
 def _contains_team_token(haystack: str, team: str) -> bool:
@@ -176,6 +253,223 @@ def _coupon_reset_alert_present(error_text: str) -> bool:
         "combination with live bets is not allowed" in lowered
         or "only pinnacle combo odds can be used for pinnacle parlay bet" in lowered
     )
+
+
+def is_recoverable_submit_error(reason: str) -> bool:
+    lowered = normalize(reason or "").lower()
+    if not lowered:
+        return False
+    return any(marker in lowered for marker in _RECOVERABLE_SUBMIT_MARKERS)
+
+
+def resolve_forced_league_alias(
+    tournament: str,
+    aliases: Optional[dict[str, str]],
+    available_titles: list[str],
+) -> dict[str, Any]:
+    normalized_tournament = normalize(tournament)
+    alias_source = ""
+    alias_target = ""
+
+    for source, target in (aliases or {}).items():
+        source_norm = normalize(source)
+        target_norm = normalize(target)
+        if not source_norm or not target_norm:
+            continue
+        if source_norm == normalized_tournament:
+            alias_source = source
+            alias_target = target
+            break
+
+    if not alias_target:
+        return {
+            "has_alias": False,
+            "found": False,
+            "alias_source": "",
+            "alias_target": "",
+            "matched_title": "",
+            "forced_alias_not_found": False,
+        }
+
+    normalized_target = normalize(alias_target)
+    matched_title = ""
+    for title in available_titles:
+        if normalize(title) == normalized_target:
+            matched_title = title
+            break
+
+    found = bool(matched_title)
+    return {
+        "has_alias": True,
+        "found": found,
+        "alias_source": alias_source,
+        "alias_target": alias_target,
+        "matched_title": matched_title,
+        "forced_alias_not_found": not found,
+    }
+
+
+def resolve_period_tab_request(intent: BetIntent) -> dict[str, Any]:
+    key = "full_event"
+    if intent.market == "team_total":
+        key = "team_total"
+    elif intent.period == "1h":
+        key = "first_half"
+    elif intent.period == "2h":
+        key = "second_half"
+
+    synonyms = _PERIOD_TAB_SYNONYMS[key]
+    return {
+        "key": key,
+        "primary": synonyms[0],
+        "synonyms": list(synonyms),
+    }
+
+
+def tab_text_matches_synonyms(tab_text: str, synonyms: list[str]) -> bool:
+    normalized_tab = normalize(tab_text)
+    if not normalized_tab:
+        return False
+    compact_tab = normalized_tab.replace(" ", "")
+
+    for item in synonyms:
+        normalized_item = normalize(item)
+        if not normalized_item:
+            continue
+        compact_item = normalized_item.replace(" ", "")
+        if normalized_tab == normalized_item:
+            return True
+        if compact_tab == compact_item:
+            return True
+        if normalized_item in normalized_tab:
+            return True
+    return False
+
+
+def build_league_selection_plan(
+    league_entries: list[dict[str, Any]],
+    tournament: str,
+    metric: str,
+    *,
+    league_aliases: Optional[dict[str, str]] = None,
+    fallback_top_n: int = _DEFAULT_LEAGUE_FALLBACK_CANDIDATES,
+) -> dict[str, Any]:
+    metric_hint = detect_metric_hint_from_tournament(tournament)
+    effective_metric = metric_hint or metric
+
+    available_titles = [str(item.get("title", "")) for item in league_entries if item.get("title")]
+    alias_info = resolve_forced_league_alias(tournament, league_aliases, available_titles)
+
+    scored: list[dict[str, Any]] = []
+    for entry in league_entries:
+        index = int(entry.get("index", -1))
+        title_text = normalize(str(entry.get("title", "")))
+        if index < 0 or not title_text:
+            continue
+
+        passes_metric = league_passes_metric(title_text, effective_metric)
+        if normalize(effective_metric) in {"corners", "bookings"} and not passes_metric:
+            continue
+
+        score = score_league_candidate(title_text, tournament, effective_metric)
+        scored.append(
+            {
+                "index": index,
+                "title": title_text,
+                "score": round(score, 4),
+                "metric_ok": passes_metric,
+                "method": "fuzzy",
+            }
+        )
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    ordered: list[dict[str, Any]] = []
+
+    if bool(alias_info.get("found")):
+        matched_title = normalize(str(alias_info.get("matched_title", "")))
+        forced_entry = next(
+            (
+                entry
+                for entry in league_entries
+                if normalize(str(entry.get("title", ""))) == matched_title
+            ),
+            None,
+        )
+        if forced_entry is not None:
+            ordered.append(
+                {
+                    "index": int(forced_entry.get("index", -1)),
+                    "title": normalize(str(forced_entry.get("title", ""))),
+                    "score": 1.0,
+                    "metric_ok": True,
+                    "method": "forced_alias",
+                    "alias_source": alias_info.get("alias_source", ""),
+                    "alias_target": alias_info.get("alias_target", ""),
+                }
+            )
+
+    limit = max(1, int(fallback_top_n))
+    for candidate in scored:
+        if any(existing.get("title") == candidate.get("title") for existing in ordered):
+            continue
+        ordered.append(candidate)
+        if len(ordered) >= limit:
+            break
+
+    if not ordered:
+        diagnostics = {
+            "metric": metric,
+            "metric_hint": metric_hint,
+            "effective_metric": effective_metric,
+            "tournament": tournament,
+            "forced_alias": alias_info,
+        }
+        if not scored:
+            raise BlogabetPublishError(
+                "find_league",
+                "Не найдено лиг, соответствующих типу ставки",
+                diagnostics=diagnostics,
+            )
+        raise BlogabetPublishError(
+            "find_league",
+            "Не удалось сформировать список кандидатов лиги",
+            diagnostics=diagnostics,
+        )
+
+    return {
+        "best": ordered[0],
+        "ordered_candidates": ordered,
+        "top_candidates": scored[:10],
+        "metric_hint": metric_hint,
+        "effective_metric": effective_metric,
+        "forced_alias": alias_info,
+    }
+
+
+async def _read_league_title(link: Any) -> str:
+    title_node = link.locator(SELECTORS.LEAGUE_TITLE)
+    if await title_node.count():
+        return normalize(await title_node.inner_text())
+    return normalize(await link.inner_text())
+
+
+async def _collect_league_entries(page: AsyncPage) -> list[dict[str, Any]]:
+    league_links = page.locator(SELECTORS.LEAGUE_LINKS)
+    total = await league_links.count()
+    if total == 0:
+        raise BlogabetPublishError("find_league", "Список лиг Football пуст")
+
+    entries: list[dict[str, Any]] = []
+    for index in range(total):
+        link = league_links.nth(index)
+        try:
+            title_text = await _read_league_title(link)
+        except Exception:  # noqa: BLE001
+            title_text = ""
+        if not title_text:
+            continue
+        entries.append({"index": index, "title": title_text})
+    return entries
 
 
 def _coupon_matches_intent(card_raw_text: str, intent: BetIntent) -> tuple[bool, dict[str, Any]]:
@@ -239,73 +533,32 @@ async def select_league_by_tournament(
     page: AsyncPage,
     tournament: str,
     metric: str,
+    *,
+    league_aliases: Optional[dict[str, str]] = None,
+    fallback_top_n: int = _DEFAULT_LEAGUE_FALLBACK_CANDIDATES,
 ) -> dict[str, Any]:
-    metric_hint = detect_metric_hint_from_tournament(tournament)
-    effective_metric = metric_hint or metric
+    entries = await _collect_league_entries(page)
+    plan = build_league_selection_plan(
+        entries,
+        tournament,
+        metric,
+        league_aliases=league_aliases,
+        fallback_top_n=fallback_top_n,
+    )
 
     league_links = page.locator(SELECTORS.LEAGUE_LINKS)
-    total = await league_links.count()
-    if total == 0:
-        raise BlogabetPublishError("find_leagues", "Список лиг Football пуст")
-
-    scored: list[dict[str, Any]] = []
-    for index in range(total):
-        link = league_links.nth(index)
-        title_node = link.locator(SELECTORS.LEAGUE_TITLE)
-        title_text = normalize(await title_node.inner_text() if await title_node.count() else await link.inner_text())
-        if not title_text:
-            continue
-
-        passes_metric = league_passes_metric(title_text, effective_metric)
-        if normalize(effective_metric) in {"corners", "bookings"} and not passes_metric:
-            continue
-
-        score = score_league_candidate(title_text, tournament, effective_metric)
-        scored.append(
-            {
-                "index": index,
-                "title": title_text,
-                "score": round(score, 4),
-                "metric_ok": passes_metric,
-            }
-        )
-
-    if not scored:
-        raise BlogabetPublishError(
-            "find_leagues",
-            "Не найдено лиг, соответствующих типу ставки",
-            diagnostics={
-                "metric": metric,
-                "metric_hint": metric_hint,
-                "effective_metric": effective_metric,
-                "tournament": tournament,
-            },
-        )
-
-    scored.sort(key=lambda item: item["score"], reverse=True)
-    best = scored[0]
-    if float(best["score"]) < 0.25:
-        raise BlogabetPublishError(
-            "find_leagues",
-            "Не удалось уверенно сопоставить лигу",
-            diagnostics={
-                "metric": metric,
-                "metric_hint": metric_hint,
-                "effective_metric": effective_metric,
-                "tournament": tournament,
-                "league_candidates": scored[:10],
-            },
-        )
-
+    best = plan["best"]
     best_link = league_links.nth(int(best["index"]))
     await best_link.scroll_into_view_if_needed()
     await best_link.click()
 
     return {
         "best": best,
-        "top_candidates": scored[:10],
-        "metric_hint": metric_hint,
-        "effective_metric": effective_metric,
+        "ordered_candidates": plan.get("ordered_candidates", []),
+        "top_candidates": plan.get("top_candidates", []),
+        "metric_hint": plan.get("metric_hint"),
+        "effective_metric": plan.get("effective_metric"),
+        "forced_alias": plan.get("forced_alias", {}),
     }
 
 
@@ -326,6 +579,8 @@ class BlogabetPublisher:
         self._browser: Optional[AsyncBrowser] = None
         self._context: Optional[AsyncBrowserContext] = None
         self._debug_dir = Path(__file__).resolve().parent / "debug" / "blogabet"
+        self._mismatch_log_path = Path(__file__).resolve().parent / "blogabet_mismatches.jsonl"
+        self._league_aliases = self._load_league_aliases()
 
     def _log(self, level: str, message: str, *args: Any) -> None:
         logger = self.logger
@@ -341,11 +596,79 @@ class BlogabetPublisher:
         except Exception:  # noqa: BLE001
             return
 
-    def _storage_state_path(self) -> Path:
-        path = Path(self.cfg.storage_state_path)
+    def _resolve_cfg_path(self, raw_path: str) -> Path:
+        path = Path(raw_path)
         if not path.is_absolute():
             path = Path(__file__).resolve().parent / path
         return path
+
+    def _storage_state_path(self) -> Path:
+        return self._resolve_cfg_path(self.cfg.storage_state_path)
+
+    def _league_aliases_path(self) -> Path:
+        return self._resolve_cfg_path(self.cfg.league_aliases_path)
+
+    def _load_league_aliases(self) -> dict[str, str]:
+        path = self._league_aliases_path()
+        if not path.exists():
+            self._log("info", "Blogabet aliases: файл не найден, продолжаем без алиасов (%s)", path)
+            return {}
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "Blogabet aliases: ошибка парсинга %s: %s", path, exc)
+            return {}
+
+        aliases_payload = payload.get("aliases") if isinstance(payload, dict) else None
+        if not isinstance(aliases_payload, dict):
+            self._log("warning", "Blogabet aliases: ключ aliases отсутствует или имеет неверный формат (%s)", path)
+            return {}
+
+        aliases: dict[str, str] = {}
+        for source, target in aliases_payload.items():
+            source_text = normalize(str(source))
+            target_text = normalize(str(target))
+            if not source_text or not target_text:
+                continue
+            aliases[source_text] = target_text
+
+        self._log("info", "Blogabet aliases: загружено %s записей из %s", len(aliases), path)
+        return aliases
+
+    def _append_mismatch_diagnostics(
+        self,
+        *,
+        match: Any,
+        bet_intent: BetIntent,
+        diagnostics: dict[str, Any],
+        failure_step: str,
+        failure_reason: str,
+    ) -> None:
+        selected_league_best = diagnostics.get("selected_league")
+        if not selected_league_best:
+            league_candidates = diagnostics.get("league_candidates", [])
+            if isinstance(league_candidates, list) and league_candidates:
+                selected_league_best = league_candidates[0]
+
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tournament": normalize(str(getattr(match, "tournament", ""))),
+            "metric": normalize(bet_intent.metric),
+            "selected_league_best": selected_league_best,
+            "top_league_candidates": diagnostics.get("league_candidates", [])[:10],
+            "home_team": normalize(str(getattr(match, "home_team", ""))),
+            "away_team": normalize(str(getattr(match, "away_team", ""))),
+            "failure_step": failure_step,
+            "failure_reason": normalize(failure_reason),
+        }
+
+        try:
+            self._mismatch_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._mismatch_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "Не удалось записать blogabet mismatch diagnostics: %s", exc)
 
     @staticmethod
     def _base_origin(url: str) -> str:
@@ -354,23 +677,96 @@ class BlogabetPublisher:
             return f"{parsed.scheme}://{parsed.netloc}"
         return "https://blogabet.com"
 
-    async def _launch_browser(self, playwright: AsyncPlaywright, *, headless: bool) -> AsyncBrowser:
-        if self._browser_factory is None:
-            return await playwright.chromium.launch(headless=headless)
+    def _effective_headless(self, requested_headless: bool) -> bool:
+        if requested_headless:
+            return True
+        if os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"):
+            return False
+        self._log(
+            "warning",
+            "Графическая сессия не обнаружена (DISPLAY/WAYLAND_DISPLAY), запускаю браузер в headless-режиме.",
+        )
+        return True
 
-        maybe_browser = self._browser_factory(playwright, headless)
+    async def _launch_browser(self, playwright: AsyncPlaywright, *, headless: bool) -> AsyncBrowser:
+        effective_headless = self._effective_headless(headless)
+        if self._browser_factory is None:
+            return await playwright.chromium.launch(headless=effective_headless)
+
+        maybe_browser = self._browser_factory(playwright, effective_headless)
         if inspect.isawaitable(maybe_browser):
             return await maybe_browser
         return maybe_browser
 
     async def _open_login_popup(self, page: AsyncPage) -> None:
+        async def _login_form_exists(*, wait_timeout: int = 0) -> bool:
+            form = page.locator(SELECTORS.LOGIN_FORM).first
+            try:
+                if wait_timeout > 0:
+                    await form.wait_for(state="attached", timeout=wait_timeout)
+                if await form.count() == 0:
+                    return False
+                return True
+            except Exception:  # noqa: BLE001
+                return False
+
+        async def _login_controls_exist(*, wait_timeout: int = 0) -> bool:
+            if await _login_form_exists(wait_timeout=wait_timeout):
+                return True
+            email_node = await _first_visible(page.locator(SELECTORS.LOGIN_EMAIL_INPUT))
+            password_node = await _first_visible(page.locator(SELECTORS.LOGIN_PASSWORD_INPUT))
+            submit_node = await _first_visible(page.locator(SELECTORS.LOGIN_SUBMIT_BUTTON))
+            if email_node and password_node and submit_node:
+                return True
+            email_node_present = await _first_present(page.locator(SELECTORS.LOGIN_EMAIL_INPUT))
+            password_node_present = await _first_present(page.locator(SELECTORS.LOGIN_PASSWORD_INPUT))
+            submit_node_present = await _first_present(page.locator(SELECTORS.LOGIN_SUBMIT_BUTTON))
+            return bool(email_node_present and password_node_present and submit_node_present)
+
+        # На части страниц форма логина уже отрисована без popup.
+        if await _login_controls_exist(wait_timeout=1200):
+            return
+
         login_trigger = page.locator(SELECTORS.LOGIN_TRIGGER)
-        if await login_trigger.count() == 0:
-            raise BlogabetAuthRequired(
-                "Не найдена кнопка открытия login popup на главной странице Blogabet."
+        if await login_trigger.count() > 0:
+            clicked = False
+            for index in range(min(await login_trigger.count(), 5)):
+                node = login_trigger.nth(index)
+                try:
+                    if await node.is_visible():
+                        await node.click(timeout=5000)
+                        clicked = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if clicked:
+                await page.wait_for_timeout(500)
+
+        # Доп. попытка принудительно открыть login-модалку через hash/Bootstrap.
+        try:
+            await page.evaluate(
+                """
+() => {
+  try { window.location.hash = "login"; } catch (_err) {}
+  const modal = document.querySelector("#systemModal");
+  if (!modal) return;
+  try {
+    if (window.jQuery && typeof window.jQuery(modal).modal === "function") {
+      window.jQuery(modal).modal("show");
+      return;
+    }
+  } catch (_err) {}
+  try {
+    modal.classList.add("in", "show");
+    modal.style.display = "block";
+    modal.removeAttribute("aria-hidden");
+  } catch (_err) {}
+}
+""",
             )
-        await login_trigger.first.click(timeout=8000)
-        await page.wait_for_timeout(400)
+            await page.wait_for_timeout(500)
+        except Exception:  # noqa: BLE001
+            pass
 
         login_modal = page.locator(SELECTORS.LOGIN_MODAL)
         if await login_modal.count() > 0:
@@ -379,11 +775,41 @@ class BlogabetPublisher:
             except Exception:  # noqa: BLE001
                 pass
 
-        login_form = page.locator(SELECTORS.LOGIN_FORM)
-        if await login_form.count() == 0:
-            raise BlogabetAuthRequired(
-                "Login popup не открылся (форма form#form-login не найдена)."
-            )
+        if await _login_controls_exist(wait_timeout=3000):
+            return
+
+        # Fallback для headless/серверных сценариев: открываем прямую страницу логина.
+        base_origin = self._base_origin(self.cfg.login_url) or self._base_origin(self.cfg.upcoming_url)
+        fallback_urls = [
+            (self.cfg.login_url or "").strip(),
+            f"{base_origin}/login",
+            f"{base_origin}/signin",
+            f"{base_origin}/#login",
+            base_origin,
+        ]
+        seen: set[str] = set()
+        for raw_url in fallback_urls:
+            target_url = (raw_url or "").strip()
+            if not target_url or target_url in seen:
+                continue
+            seen.add(target_url)
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(700)
+                await self._dismiss_age_confirmation(page)
+                try:
+                    await page.evaluate("() => { try { window.location.hash = 'login'; } catch (_err) {} }")
+                except Exception:  # noqa: BLE001
+                    pass
+                if await _login_controls_exist(wait_timeout=3000):
+                    return
+            except Exception:  # noqa: BLE001
+                continue
+
+        current_url = (page.url or "").strip()
+        raise BlogabetAuthRequired(
+            f"Login popup не открылся (форма логина не найдена). url={current_url or '-'}"
+        )
 
     async def _is_login_form_visible(self, page: AsyncPage) -> bool:
         try:
@@ -400,20 +826,42 @@ class BlogabetPublisher:
         if not email or not password:
             return False
 
-        login_form = page.locator(SELECTORS.LOGIN_FORM).first
-        if await login_form.count() == 0:
-            return False
+        forms = page.locator(SELECTORS.LOGIN_FORM)
+        total_forms = await forms.count()
 
-        email_input = login_form.locator(SELECTORS.LOGIN_EMAIL_INPUT).first
-        password_input = login_form.locator(SELECTORS.LOGIN_PASSWORD_INPUT).first
-        submit_button = login_form.locator(SELECTORS.LOGIN_SUBMIT_BUTTON).first
-        if (
-            await email_input.count() == 0
-            or await password_input.count() == 0
-            or await submit_button.count() == 0
-        ):
-            return False
+        for index in range(min(total_forms, 5)):
+            login_form = forms.nth(index)
+            try:
+                if not await login_form.is_visible():
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
 
+            email_input = login_form.locator(SELECTORS.LOGIN_EMAIL_INPUT).first
+            password_input = login_form.locator(SELECTORS.LOGIN_PASSWORD_INPUT).first
+            submit_button = login_form.locator(SELECTORS.LOGIN_SUBMIT_BUTTON).first
+            if (
+                await email_input.count() == 0
+                or await password_input.count() == 0
+                or await submit_button.count() == 0
+            ):
+                continue
+
+            await email_input.fill(email)
+            await password_input.fill(password)
+            await submit_button.click()
+            return True
+
+        # Fallback: поля могут быть вне form.
+        email_input = await _first_visible(page.locator(SELECTORS.LOGIN_EMAIL_INPUT))
+        password_input = await _first_visible(page.locator(SELECTORS.LOGIN_PASSWORD_INPUT))
+        submit_button = await _first_visible(page.locator(SELECTORS.LOGIN_SUBMIT_BUTTON))
+        if not email_input or not password_input or not submit_button:
+            email_input = await _first_present(page.locator(SELECTORS.LOGIN_EMAIL_INPUT))
+            password_input = await _first_present(page.locator(SELECTORS.LOGIN_PASSWORD_INPUT))
+            submit_button = await _first_present(page.locator(SELECTORS.LOGIN_SUBMIT_BUTTON))
+            if not email_input or not password_input or not submit_button:
+                return False
         await email_input.fill(email)
         await password_input.fill(password)
         await submit_button.click()
@@ -477,11 +925,18 @@ class BlogabetPublisher:
     async def interactive_login_and_save_state(self) -> str:
         storage_state_path = self._storage_state_path()
         storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+        headless_login = self._effective_headless(False)
+        if headless_login and not ((self.cfg.login_email or "").strip() and (self.cfg.login_password or "")):
+            raise BlogabetAuthRequired(
+                "На сервере без GUI интерактивный логин недоступен. "
+                "Укажите BLOGABET_LOGIN_EMAIL/BLOGABET_LOGIN_PASSWORD "
+                "или загрузите готовый storage state."
+            )
 
         manual_playwright = await async_playwright().start()
         browser: Optional[AsyncBrowser] = None
         try:
-            browser = await self._launch_browser(manual_playwright, headless=False)
+            browser = await self._launch_browser(manual_playwright, headless=headless_login)
             context = await browser.new_context()
             page = await context.new_page()
             home_url = self._base_origin(self.cfg.login_url) or self._base_origin(self.cfg.upcoming_url)
@@ -578,41 +1033,260 @@ class BlogabetPublisher:
         await football_trigger.first.click()
         await page.wait_for_timeout(400)
 
-    async def _switch_period_tab(self, page: AsyncPage, intent: BetIntent) -> None:
-        tab_target_text = "Full Event"
-        if intent.market == "team_total":
-            tab_target_text = "Team Total"
-        elif intent.period == "1h":
-            tab_target_text = "First Half"
-        elif intent.period == "2h":
-            tab_target_text = "Second Half"
+    async def _resolve_league_link_for_candidate(
+        self,
+        page: AsyncPage,
+        candidate: dict[str, Any],
+    ) -> Any:
+        league_links = page.locator(SELECTORS.LEAGUE_LINKS)
+        total = await league_links.count()
+        if total == 0:
+            return None
 
+        candidate_title = normalize(str(candidate.get("title", "")))
+        candidate_index = int(candidate.get("index", -1))
+        if 0 <= candidate_index < total:
+            by_index = league_links.nth(candidate_index)
+            if not candidate_title:
+                return by_index
+            try:
+                by_index_title = await _read_league_title(by_index)
+                if by_index_title == candidate_title:
+                    return by_index
+            except Exception:  # noqa: BLE001
+                pass
+
+        if candidate_title:
+            for index in range(total):
+                item = league_links.nth(index)
+                try:
+                    item_title = await _read_league_title(item)
+                except Exception:  # noqa: BLE001
+                    continue
+                if item_title == candidate_title:
+                    candidate["index"] = index
+                    return item
+
+        return None
+
+    async def _click_league_candidate(
+        self,
+        page: AsyncPage,
+        candidate: dict[str, Any],
+    ) -> None:
+        league_link = await self._resolve_league_link_for_candidate(page, candidate)
+        if league_link is None:
+            available: list[str] = []
+            try:
+                entries = await _collect_league_entries(page)
+                available = [str(entry.get("title", "")) for entry in entries[:20]]
+            except Exception:  # noqa: BLE001
+                available = []
+            raise BlogabetPublishError(
+                "find_league",
+                f"Не удалось выбрать лигу: {candidate.get('title') or '-'}",
+                diagnostics={"candidate": candidate, "available_leagues_sample": available},
+            )
+
+        try:
+            await league_link.scroll_into_view_if_needed()
+            await league_link.click()
+            await page.wait_for_timeout(450)
+        except Exception as exc:  # noqa: BLE001
+            raise BlogabetPublishError(
+                "find_league",
+                f"Не удалось кликнуть по лиге: {candidate.get('title') or '-'}",
+                diagnostics={"candidate": candidate, "click_error": normalize(str(exc))[:220]},
+            ) from exc
+
+    async def _wait_for_events_after_league_selection(self, page: AsyncPage) -> None:
+        try:
+            await page.wait_for_selector(SELECTORS.EVENT_CONTAINER, state="attached", timeout=30000)
+        except Exception as exc:  # noqa: BLE001
+            raise BlogabetPublishError(
+                "find_league",
+                "Не удалось дождаться загрузки событий после выбора лиги",
+                diagnostics={"wait_error": normalize(str(exc))[:220]},
+            ) from exc
+        await page.wait_for_timeout(700)
+
+    async def _reclick_league_candidate(
+        self,
+        page: AsyncPage,
+        candidate: dict[str, Any],
+    ) -> bool:
+        try:
+            await self._click_league_candidate(page, candidate)
+            await self._wait_for_events_after_league_selection(page)
+            return True
+        except BlogabetPublishError:
+            return False
+
+    async def _switch_period_tab(
+        self,
+        page: AsyncPage,
+        intent: BetIntent,
+        *,
+        selected_league_candidate: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        tab_request = resolve_period_tab_request(intent)
+        tab_target_text = str(tab_request["primary"])
+        tab_synonyms = [str(item) for item in tab_request["synonyms"]]
+
+        diagnostics: dict[str, Any] = {
+            "tab_target": tab_target_text,
+            "tab_synonyms": tab_synonyms,
+            "attempts": [],
+        }
         tabs = page.locator(SELECTORS.EVENT_TAB_LINKS)
-        for _ in range(10):
-            total_tabs = await tabs.count()
-            if total_tabs == 0:
-                await page.wait_for_timeout(500)
+        reclick_done = False
+
+        for attempt_no in range(1, 4):
+            attempt_diag: dict[str, Any] = {"attempt": attempt_no}
+            wait_timeout = 2500 + (attempt_no - 1) * 2500
+            try:
+                await page.wait_for_selector(SELECTORS.EVENT_TAB_LINKS, state="attached", timeout=wait_timeout)
+                attempt_diag["tabs_wait"] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                attempt_diag["tabs_wait"] = "timeout"
+                attempt_diag["wait_error"] = normalize(str(exc))[:220]
+                if not reclick_done and selected_league_candidate is not None:
+                    reclick_done = await self._reclick_league_candidate(page, selected_league_candidate)
+                    attempt_diag["league_reclick"] = reclick_done
+                diagnostics["attempts"].append(attempt_diag)
+                await page.wait_for_timeout(600 + attempt_no * 250)
                 continue
 
+            total_tabs = await tabs.count()
+            attempt_diag["tab_count"] = total_tabs
+            tab_titles: list[str] = []
             for index in range(total_tabs):
                 tab = tabs.nth(index)
                 tab_text = normalize(await tab.inner_text())
-                if tab_target_text.lower() not in tab_text.lower():
+                if not tab_text:
                     continue
+                tab_titles.append(tab_text)
+                if not tab_text_matches_synonyms(tab_text, tab_synonyms):
+                    continue
+                await tab.scroll_into_view_if_needed()
                 await tab.click()
-                await page.wait_for_timeout(400)
-                return
+                await page.wait_for_timeout(450)
+                attempt_diag["result"] = "selected"
+                attempt_diag["selected_tab"] = tab_text
+                attempt_diag["available_tabs"] = tab_titles[:15]
+                diagnostics["attempts"].append(attempt_diag)
+                diagnostics["selected_tab"] = tab_text
+                diagnostics["reclicked_league"] = reclick_done
+                return diagnostics
 
-            # Вкладки есть, но target может появиться после догрузки.
-            await page.wait_for_timeout(400)
+            attempt_diag["result"] = "tab_not_found"
+            attempt_diag["available_tabs"] = tab_titles[:15]
+            if not reclick_done and selected_league_candidate is not None:
+                reclick_done = await self._reclick_league_candidate(page, selected_league_candidate)
+                attempt_diag["league_reclick"] = reclick_done
+            diagnostics["attempts"].append(attempt_diag)
+            await page.wait_for_timeout(600 + attempt_no * 250)
 
+        diagnostics["reclicked_league"] = reclick_done
         total_tabs = await tabs.count()
         if total_tabs == 0:
-            raise BlogabetPublishError("switch_period_tab", "Вкладки рынков не найдены")
+            raise BlogabetPublishError(
+                "switch_period_tab",
+                "Вкладки рынков не найдены",
+                diagnostics=diagnostics,
+            )
 
         raise BlogabetPublishError(
             "switch_period_tab",
             f"Не найдена вкладка периода: {tab_target_text}",
+            diagnostics=diagnostics,
+        )
+
+    async def _find_match_with_league_fallback(
+        self,
+        page: AsyncPage,
+        match: Any,
+        bet_intent: BetIntent,
+        diagnostics: dict[str, Any],
+    ) -> tuple[int, dict[str, Any], dict[str, Any]]:
+        entries = await _collect_league_entries(page)
+        league_plan = build_league_selection_plan(
+            entries,
+            match.tournament,
+            bet_intent.metric,
+            league_aliases=self._league_aliases,
+            fallback_top_n=_DEFAULT_LEAGUE_FALLBACK_CANDIDATES,
+        )
+        diagnostics["league_candidates"] = league_plan.get("top_candidates", [])
+
+        forced_alias = league_plan.get("forced_alias", {})
+        if bool(forced_alias.get("has_alias")):
+            diagnostics["forced_alias"] = forced_alias
+        if bool(forced_alias.get("forced_alias_not_found")):
+            diagnostics["forced_alias_not_found"] = True
+
+        league_attempts: list[dict[str, Any]] = []
+        ordered_candidates = [
+            dict(item) for item in league_plan.get("ordered_candidates", []) if isinstance(item, dict)
+        ]
+        last_error: Optional[BlogabetPublishError] = None
+
+        for candidate in ordered_candidates:
+            attempt_diag = {
+                "title": candidate.get("title"),
+                "score": candidate.get("score"),
+                "method": candidate.get("method", "fuzzy"),
+                "result": "started",
+                "fail_reason": "",
+            }
+            try:
+                await self._click_league_candidate(page, candidate)
+                await self._wait_for_events_after_league_selection(page)
+                tab_diag = await self._switch_period_tab(
+                    page,
+                    bet_intent,
+                    selected_league_candidate=candidate,
+                )
+                attempt_diag["period_tab"] = tab_diag
+                best_block_index, match_result = await self._find_event_block(
+                    page,
+                    match.home_team,
+                    match.away_team,
+                )
+                attempt_diag["result"] = "match_found"
+                attempt_diag["selected_match"] = match_result.get("best")
+                league_attempts.append(attempt_diag)
+
+                diagnostics["league_attempts"] = league_attempts
+                diagnostics["selected_league"] = candidate
+                diagnostics["match_candidates"] = match_result.get("top_candidates", [])
+                diagnostics["selected_match"] = match_result.get("best")
+                return best_block_index, match_result, candidate
+            except BlogabetPublishError as exc:
+                last_error = exc
+                attempt_diag["result"] = "failed"
+                attempt_diag["fail_step"] = exc.step_name
+                attempt_diag["fail_reason"] = exc.reason
+                if exc.diagnostics:
+                    attempt_diag["fail_diagnostics"] = exc.diagnostics
+                league_attempts.append(attempt_diag)
+                await page.wait_for_timeout(350)
+                continue
+
+        diagnostics["league_attempts"] = league_attempts
+        if last_error is not None:
+            merged_diag = dict(diagnostics)
+            merged_diag.update(last_error.diagnostics)
+            raise BlogabetPublishError(
+                "find_match",
+                "Не удалось найти матч после перебора кандидатов лиги",
+                diagnostics=merged_diag,
+            ) from last_error
+
+        raise BlogabetPublishError(
+            "find_match",
+            "Не удалось найти матч: список кандидатов лиги пуст",
+            diagnostics=diagnostics,
         )
 
     async def _find_event_block(self, page: AsyncPage, home_team: str, away_team: str) -> tuple[int, dict[str, Any]]:
@@ -1020,6 +1694,7 @@ class BlogabetPublisher:
             if not bool(live_state_after.get("all_filled", False)):
                 return False, diagnostics, "live_score_not_filled"
 
+        diagnostics["auto_accept_policy"] = await self._set_auto_accept_policy(page, allow_any=True)
         return True, diagnostics, ""
 
     async def _set_stake(self, page: AsyncPage, stake: int) -> None:
@@ -1497,18 +2172,13 @@ class BlogabetPublisher:
                 await self._select_football(page)
 
                 step_name = "find_league"
-                league_result = await select_league_by_tournament(page, match.tournament, bet_intent.metric)
-                diagnostics["league_candidates"] = league_result.get("top_candidates", [])
-                diagnostics["selected_league"] = league_result.get("best")
-
-                await page.wait_for_selector(SELECTORS.EVENT_CONTAINER, timeout=30000)
-                await page.wait_for_timeout(700)
-
-                step_name = "switch_period_tab"
-                await self._switch_period_tab(page, bet_intent)
-
-                step_name = "find_match"
-                best_block_index, match_result = await self._find_event_block(page, match.home_team, match.away_team)
+                best_block_index, match_result, selected_league = await self._find_match_with_league_fallback(
+                    page,
+                    match,
+                    bet_intent,
+                    diagnostics,
+                )
+                diagnostics["selected_league"] = selected_league
                 diagnostics["match_candidates"] = match_result.get("top_candidates", [])
                 diagnostics["selected_match"] = match_result.get("best")
 
@@ -1657,20 +2327,24 @@ class BlogabetPublisher:
                     pick_url = await self._extract_pick_url(page, start_url, before_badge)
                 except BlogabetPublishError as submit_exc:
                     lowered_reason = normalize(submit_exc.reason).lower()
-                    is_odds_drop = "odds dropped" in lowered_reason
+                    is_recoverable_price_change = is_recoverable_submit_error(lowered_reason)
                     should_retry_submit = (
                         _coupon_reset_alert_present(lowered_reason)
-                        or is_odds_drop
+                        or is_recoverable_price_change
                     )
                     if should_retry_submit:
-                        max_recovery_attempts = 3 if is_odds_drop else 1
+                        max_recovery_attempts = 3 if is_recoverable_price_change else 1
                         diagnostics["submit_recovery"] = (
-                            "odds_dropped_multi_retry" if is_odds_drop else "clear_coupon_and_retry_once"
+                            "price_changed_multi_retry"
+                            if is_recoverable_price_change
+                            else "clear_coupon_and_retry_once"
                         )
                         last_retry_exc: Optional[BlogabetPublishError] = submit_exc
                         pick_url = None
                         for recovery_attempt in range(1, max_recovery_attempts + 1):
                             diagnostics[f"submit_recovery_attempt_{recovery_attempt}_reason"] = lowered_reason
+                            if recovery_attempt > 1:
+                                await page.wait_for_timeout(900 + recovery_attempt * 500)
                             recovered_removed = await self._clear_coupon(page, strict=True)
                             diagnostics[f"coupon_items_removed_for_recovery_{recovery_attempt}"] = (
                                 recovered_removed
@@ -1692,9 +2366,8 @@ class BlogabetPublisher:
                             )
                             diagnostics[f"live_score_candidate_retry_{recovery_attempt}"] = score_candidate_retry
                             diagnostics[f"live_score_filled_retry_{recovery_attempt}"] = live_score_filled_retry
-                            if is_odds_drop:
-                                odds_policy = await self._set_auto_accept_policy(page, allow_any=True)
-                                diagnostics[f"odds_policy_retry_{recovery_attempt}"] = odds_policy
+                            odds_policy = await self._set_auto_accept_policy(page, allow_any=True)
+                            diagnostics[f"odds_policy_retry_{recovery_attempt}"] = odds_policy
 
                             need_reselect_submit_retry, coupon_diag_submit_retry = await self._coupon_needs_reselect(
                                 page,
@@ -1766,11 +2439,11 @@ class BlogabetPublisher:
                                     lowered_retry_reason
                                 )
                                 if (
-                                    is_odds_drop
-                                    and "odds dropped" in lowered_retry_reason
+                                    is_recoverable_price_change
+                                    and is_recoverable_submit_error(lowered_retry_reason)
                                     and recovery_attempt < max_recovery_attempts
                                 ):
-                                    await page.wait_for_timeout(1200)
+                                    await page.wait_for_timeout(900 + recovery_attempt * 500)
                                     continue
                                 raise
                         if not pick_url and last_retry_exc is not None:
@@ -1793,9 +2466,17 @@ class BlogabetPublisher:
                 )
 
             except BlogabetPublishError as exc:
-                screenshot_path, html_dump_path = await self._capture_debug_artifacts(page, exc.step_name)
                 merged_diagnostics = dict(diagnostics)
                 merged_diagnostics.update(exc.diagnostics)
+                if exc.step_name in {"find_league", "switch_period_tab", "find_match"}:
+                    self._append_mismatch_diagnostics(
+                        match=match,
+                        bet_intent=bet_intent,
+                        diagnostics=merged_diagnostics,
+                        failure_step=exc.step_name,
+                        failure_reason=exc.reason,
+                    )
+                screenshot_path, html_dump_path = await self._capture_debug_artifacts(page, exc.step_name)
                 raise BlogabetPublishError(
                     step_name=exc.step_name,
                     reason=exc.reason,

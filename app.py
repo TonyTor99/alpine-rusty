@@ -168,6 +168,7 @@ PARSER_SOURCES_STORAGE_FILENAME = "parser_sources.json"
 DEFAULT_MATCH_DATABASE_URL = "sqlite:///parser_matches.db"
 MAX_PENDING_SETTLEMENT_CANDIDATES = 500
 DEFAULT_BLOGABET_STORAGE_STATE_PATH = "./blogabet_state.json"
+DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH = "./blogabet_league_aliases.json"
 DEFAULT_BLOGABET_STAKE = 3
 
 
@@ -767,6 +768,23 @@ def split_chat_ids(raw_value: str) -> list[str]:
     prepared = str(raw_value).replace("\r", "\n")
     chunks = re.split(r"[,\n;]+", prepared)
     return [normalize_text(chunk) for chunk in chunks if normalize_text(chunk)]
+
+
+def parse_telegram_chat_ids(raw_value: str, *, require_non_empty: bool = False) -> tuple[str, ...]:
+    raw_chat_ids = split_chat_ids(raw_value)
+    validated: list[str] = []
+    seen: set[str] = set()
+
+    for chat_id in raw_chat_ids:
+        normalized_chat_id = validate_chat_id(chat_id)
+        if normalized_chat_id in seen:
+            continue
+        validated.append(normalized_chat_id)
+        seen.add(normalized_chat_id)
+
+    if require_non_empty and not validated:
+        raise ValueError("Нужно указать хотя бы один chat_id Telegram")
+    return tuple(validated)
 
 
 def parse_vk_chat_ids(raw_value: str, *, require_non_empty: bool = False) -> tuple[str, ...]:
@@ -2349,6 +2367,10 @@ def load_blogabet_config() -> BlogabetConfig:
         os.getenv("BLOGABET_STORAGE_STATE_PATH", DEFAULT_BLOGABET_STORAGE_STATE_PATH),
         DEFAULT_BLOGABET_STORAGE_STATE_PATH,
     )
+    league_aliases_path = resolve_local_path(
+        os.getenv("BLOGABET_LEAGUE_ALIASES_PATH", DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH),
+        DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH,
+    )
     headless = parse_bool_env(os.getenv("BLOGABET_HEADLESS", "1"), default=True)
 
     stake_raw = normalize_text(os.getenv("BLOGABET_DEFAULT_STAKE", str(DEFAULT_BLOGABET_STAKE)))
@@ -2377,6 +2399,7 @@ def load_blogabet_config() -> BlogabetConfig:
         headless=headless,
         default_stake=default_stake,
         admin_tg_chat_id=normalize_text(os.getenv("BLOGABET_ADMIN_TG_CHAT_ID", "")),
+        league_aliases_path=league_aliases_path,
         upcoming_url=normalize_text(
             os.getenv("BLOGABET_UPCOMING_URL", "https://blogabet.com/pinnacle/live")
         ) or "https://blogabet.com/pinnacle/live",
@@ -5277,22 +5300,35 @@ async def deliver_match_notification(
             except Exception:  # noqa: BLE001
                 log_blogabet_exception("Не удалось сохранить failed-доставку Blogabet в БД")
 
-            admin_chat_id = normalize_text(blogabet_cfg.admin_tg_chat_id if blogabet_cfg else "")
-            if admin_chat_id:
-                try:
-                    alert_message = build_blogabet_admin_alert_message(
-                        match,
-                        blogabet_bet_raw,
-                        error_details,
-                    )
-                    await send_telegram_match_message(
-                        tg_session,
-                        tg_cfg,
-                        admin_chat_id,
-                        alert_message,
-                    )
-                except Exception:  # noqa: BLE001
-                    log_blogabet_exception("Не удалось отправить алерт админу о сбое Blogabet")
+            raw_admin_chat_ids = blogabet_cfg.admin_tg_chat_id if blogabet_cfg else ""
+            admin_chat_ids: tuple[str, ...] = ()
+            try:
+                admin_chat_ids = parse_telegram_chat_ids(raw_admin_chat_ids)
+            except ValueError as admin_exc:
+                log_blogabet_error(
+                    "BLOGABET_ADMIN_TG_CHAT_ID содержит невалидный chat_id: %s",
+                    admin_exc,
+                )
+
+            if admin_chat_ids:
+                alert_message = build_blogabet_admin_alert_message(
+                    match,
+                    blogabet_bet_raw,
+                    error_details,
+                )
+                for admin_chat_id in admin_chat_ids:
+                    try:
+                        await send_telegram_match_message(
+                            tg_session,
+                            tg_cfg,
+                            admin_chat_id,
+                            alert_message,
+                        )
+                    except Exception:  # noqa: BLE001
+                        log_blogabet_exception(
+                            "Не удалось отправить алерт админу о сбое Blogabet. chat_id=%s",
+                            admin_chat_id,
+                        )
 
         with state.lock:
             state.parser_error = (
@@ -6262,8 +6298,9 @@ async def parser_worker_async(
             blogabet_cfg = candidate_blogabet_cfg
             ocr_client = load_ocr_client()
             logger.info(
-                "Blogabet доставка включена. storage_state=%s headless=%s stake=%s upcoming_url=%s",
+                "Blogabet доставка включена. storage_state=%s aliases=%s headless=%s stake=%s upcoming_url=%s",
                 blogabet_cfg.storage_state_path,
+                blogabet_cfg.league_aliases_path,
                 blogabet_cfg.headless,
                 blogabet_cfg.default_stake,
                 blogabet_cfg.upcoming_url,
@@ -6272,6 +6309,21 @@ async def parser_worker_async(
                 logger.warning(
                     "BLOGABET_ENABLED=1, но BLOGABET_ADMIN_TG_CHAT_ID пуст: admin-уведомления о сбоях Blogabet не будут отправляться"
                 )
+            else:
+                try:
+                    parsed_admin_chat_ids = parse_telegram_chat_ids(
+                        blogabet_cfg.admin_tg_chat_id,
+                        require_non_empty=True,
+                    )
+                    logger.info(
+                        "Blogabet admin-уведомления включены. recipients=%s",
+                        len(parsed_admin_chat_ids),
+                    )
+                except ValueError as admin_exc:
+                    logger.warning(
+                        "BLOGABET_ADMIN_TG_CHAT_ID содержит невалидный формат: %s",
+                        admin_exc,
+                    )
             if not Path(blogabet_cfg.storage_state_path).exists():
                 logger.warning(
                     "BLOGABET_ENABLED=1, но storage_state не найден: %s",
