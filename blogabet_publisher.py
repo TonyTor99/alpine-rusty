@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import datetime, timezone
 import inspect
 import json
@@ -10,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from playwright.async_api import (
     Browser as AsyncBrowser,
@@ -303,6 +304,123 @@ def _extract_numeric_tokens(value: str) -> list[float]:
     return parsed
 
 
+def _safe_base64_decode(value: str) -> str:
+    token = (value or "").strip()
+    if not token:
+        return ""
+    token = token.replace(" ", "+")
+    token += "=" * ((4 - len(token) % 4) % 4)
+    try:
+        return base64.b64decode(token).decode("utf-8", "ignore")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _canonical_market_name(value: str) -> str:
+    compact = normalize(value).replace(" ", "")
+    if not compact:
+        return ""
+    if "moneyline" in compact:
+        return "moneyline"
+    if "spread" in compact or "handicap" in compact:
+        return "spreads"
+    if "total" in compact:
+        return "totals"
+    return compact
+
+
+def _canonical_pick_name(value: str) -> str:
+    compact = normalize(value).replace(" ", "")
+    if not compact:
+        return ""
+    if "home" in compact:
+        return "home"
+    if "away" in compact:
+        return "away"
+    if "draw" in compact:
+        return "draw"
+    if "over" in compact:
+        return "over"
+    if "under" in compact:
+        return "under"
+    return compact
+
+
+def _parse_odd_button_onclick_payload(onclick: str) -> dict[str, Any]:
+    if not onclick:
+        return {}
+    payload_match = re.search(r"updateCoupon\('([^']+)'", onclick)
+    if payload_match is None:
+        return {}
+
+    encoded_payload = unquote(payload_match.group(1))
+    decoded_payload = _safe_base64_decode(encoded_payload) or encoded_payload
+    serialized_match = re.match(r'^s:\d+:"(.*)";\s*$', decoded_payload, flags=re.DOTALL)
+    payload_body = serialized_match.group(1) if serialized_match is not None else decoded_payload
+    if not payload_body:
+        return {}
+
+    parsed: dict[str, Any] = {}
+    for part in payload_body.split("^|^"):
+        if "=" not in part:
+            continue
+        key, raw_value = part.split("=", 1)
+        key_name = normalize(key).replace(" ", "")
+        value = (raw_value or "").strip()
+
+        if key_name == "marketname":
+            parsed["market_name"] = _canonical_market_name(value)
+        elif key_name == "pick":
+            parsed["pick"] = _canonical_pick_name(value)
+        elif key_name == "line":
+            parsed["line_raw"] = value
+            line_value = _extract_float(value)
+            if line_value is not None:
+                parsed["line"] = line_value
+        elif key_name == "extra":
+            parsed["extra"] = normalize(value)
+
+    if "market_name" not in parsed and parsed.get("extra"):
+        parsed["market_name"] = _canonical_market_name(str(parsed["extra"]))
+    return parsed
+
+
+def _line_diff_for_market(
+    market: str,
+    candidate_line: Optional[float],
+    intent_line: Optional[float],
+) -> Optional[float]:
+    if candidate_line is None or intent_line is None:
+        return None
+    if market == "handicap":
+        # Для форы сравниваем по модулю линии (Ф2(+1) и A -1 / H +1 в таблице).
+        return abs(abs(candidate_line) - abs(intent_line))
+    return abs(candidate_line - intent_line)
+
+
+def _contains_total_marker(value: str) -> bool:
+    lowered = normalize(value or "").lower()
+    if not lowered:
+        return False
+    return "over" in lowered or "under" in lowered
+
+
+def _contains_handicap_marker(value: str) -> bool:
+    raw = (value or "").lower()
+    if not raw:
+        return False
+    # Приводим возможные unicode-минусы к обычному '-', чтобы корректно ловить signed line.
+    raw = raw.replace("−", "-").replace("–", "-").replace("—", "-")
+    lowered = normalize(raw)
+    if not lowered:
+        return False
+    if re.search(r"\b(?:ah|hcp|hdp|handicap|spread|spreads)\b", lowered):
+        return True
+    # Для Asian handicap важен знак линии (+0.75 / -0.5). Берем только случаи без пробела после знака,
+    # чтобы не принимать live score "1 - 0" за handicap.
+    return bool(re.search(r"(?<!\d)[+\-]\d+(?:[.,]\d+)?", raw))
+
+
 def _normalize_score(value: str) -> str:
     match = re.search(r"(\d{1,2})\s*[:\-]\s*(\d{1,2})", value or "")
     if match is None:
@@ -591,12 +709,23 @@ def _coupon_matches_intent(card_raw_text: str, intent: BetIntent) -> tuple[bool,
         return scope_ok and line_ok, diag
 
     if intent.market == "moneyline":
+        has_total_marker = _contains_total_marker(raw)
+        has_handicap_marker = _contains_handicap_marker(raw)
+        diag["intent_has_total_marker"] = has_total_marker
+        diag["intent_has_handicap_marker"] = has_handicap_marker
+
         if intent.side == "home":
-            return ("home" in raw or " h " in f" {normalized} "), diag
+            side_ok = "home" in raw or " h " in f" {normalized} "
+            diag["intent_side_ok"] = side_ok
+            return side_ok and not has_total_marker and not has_handicap_marker, diag
         if intent.side == "away":
-            return ("away" in raw or " a " in f" {normalized} "), diag
+            side_ok = "away" in raw or " a " in f" {normalized} "
+            diag["intent_side_ok"] = side_ok
+            return side_ok and not has_total_marker and not has_handicap_marker, diag
         if intent.side == "draw":
-            return ("draw" in raw or " d " in f" {normalized} "), diag
+            side_ok = "draw" in raw or " d " in f" {normalized} "
+            diag["intent_side_ok"] = side_ok
+            return side_ok and not has_total_marker and not has_handicap_marker, diag
         return False, diag
 
     return False, diag
@@ -1486,57 +1615,112 @@ class BlogabetPublisher:
 
         for index in range(count):
             button = buttons.nth(index)
-            text = normalize(await button.inner_text())
+            raw_text = await button.inner_text()
+            text = normalize(raw_text)
             badge_node = button.locator(SELECTORS.ODD_BADGE)
             badge = ""
             if await badge_node.count() > 0:
                 badge = _extract_badge(await badge_node.first.inner_text())
+            onclick_attr = await button.get_attribute("onclick")
+            onclick_meta = _parse_odd_button_onclick_payload(onclick_attr or "")
+            market_name = str(onclick_meta.get("market_name", ""))
+            pick_name = str(onclick_meta.get("pick", ""))
+            line_from_payload = (
+                float(onclick_meta["line"]) if isinstance(onclick_meta.get("line"), (int, float)) else None
+            )
+            candidate_scope = ""
+            if pick_name in {"home", "away"}:
+                candidate_scope = pick_name
+            elif badge in {"h", "a"}:
+                candidate_scope = "home" if badge == "h" else "away"
+            scope_match = bool(candidate_scope and candidate_scope == intent.scope)
 
             line = _extract_float(text)
+            effective_line = line_from_payload if line_from_payload is not None else line
+            line_diff = _line_diff_for_market(intent.market, effective_line, intent.line)
             text_lower = text.lower()
+            has_total_marker = _contains_total_marker(raw_text)
+            has_handicap_marker = _contains_handicap_marker(raw_text)
+            numeric_tokens = _extract_numeric_tokens(raw_text)
 
             score = 0.0
 
             if intent.market == "moneyline":
                 expected_badge = {"home": "h", "away": "a", "draw": "d"}.get(intent.side, "")
                 score += 1.0 if badge == expected_badge else -1.0
+                if market_name:
+                    score += 2.6 if market_name == "moneyline" else -2.6
+                expected_pick = {"home": "home", "away": "away", "draw": "draw"}.get(intent.side, "")
+                if pick_name and expected_pick:
+                    score += 1.2 if pick_name == expected_pick else -1.2
+                # Для moneyline отсекаем Total/Handicap кнопки.
+                if has_total_marker:
+                    score -= 1.2
+                if has_handicap_marker:
+                    score -= 1.8
+                # В moneyline обычно одна числовая котировка. Две и более цифры чаще означают line+odds.
+                if len(numeric_tokens) >= 2:
+                    score -= 0.9
 
             elif intent.market == "handicap":
                 expected_badge = "h" if intent.scope == "home" else "a"
                 score += 0.9 if badge == expected_badge else -0.8
+                if market_name:
+                    score += 1.6 if market_name == "spreads" else -1.6
+                if candidate_scope:
+                    score += 1.2 if scope_match else -1.0
+                if has_total_marker:
+                    score -= 1.2
+                if has_handicap_marker:
+                    score += 0.6
 
-                if line is not None and intent.line is not None:
-                    score += max(0.0, 0.8 - abs(line - intent.line))
+                if line_diff is not None:
+                    score += max(0.0, 0.8 - line_diff)
                 if intent.side == "plus":
-                    score += 0.2 if (line is not None and line >= 0) else -0.2
+                    score += 0.2 if (effective_line is not None and effective_line >= 0) else -0.2
                 elif intent.side == "minus":
-                    score += 0.2 if (line is not None and line <= 0) else -0.2
+                    score += 0.2 if (effective_line is not None and effective_line <= 0) else -0.2
 
             elif intent.market == "team_total":
                 expected_badge = "h" if intent.scope == "home" else "a"
                 score += 0.9 if badge == expected_badge else -0.8
+                if market_name:
+                    score += 1.2 if market_name == "totals" else -1.2
+                if has_handicap_marker:
+                    score -= 1.2
                 if intent.side == "over":
                     score += 0.7 if "over" in text_lower else -0.7
                 elif intent.side == "under":
                     score += 0.7 if "under" in text_lower else -0.7
-                if line is not None and intent.line is not None:
-                    score += max(0.0, 0.8 - abs(line - intent.line))
+                if effective_line is not None and intent.line is not None:
+                    score += max(0.0, 0.8 - abs(effective_line - intent.line))
 
             else:  # total
+                if market_name:
+                    score += 1.4 if market_name == "totals" else -1.4
+                if has_handicap_marker:
+                    score -= 1.2
                 if intent.side == "over":
                     score += 0.8 if "over" in text_lower else -0.8
                 elif intent.side == "under":
                     score += 0.8 if "under" in text_lower else -0.8
-                if line is not None and intent.line is not None:
-                    score += max(0.0, 0.9 - abs(line - intent.line))
+                if effective_line is not None and intent.line is not None:
+                    score += max(0.0, 0.9 - abs(effective_line - intent.line))
 
             candidates.append(
                 {
                     "index": index,
                     "text": text,
                     "badge": badge,
-                    "line": line,
-                    "line_diff": abs(line - intent.line) if (line is not None and intent.line is not None) else None,
+                    "market_name": market_name,
+                    "pick_name": pick_name,
+                    "candidate_scope": candidate_scope,
+                    "scope_match": scope_match,
+                    "line": effective_line,
+                    "line_diff": line_diff,
+                    "numbers": numeric_tokens[:5],
+                    "has_total_marker": has_total_marker,
+                    "has_handicap_marker": has_handicap_marker,
                     "score": round(score, 4),
                 }
             )
@@ -1545,22 +1729,43 @@ class BlogabetPublisher:
 
         best: dict[str, Any] | None = None
         if intent.market in {"total", "team_total", "handicap"} and intent.line is not None:
-            exact_candidates = [
-                item
-                for item in candidates
-                if item.get("line") is not None
-                and item.get("line_diff") is not None
-                and float(item["line_diff"]) <= 0.01
-                and float(item["score"]) > 0.0
-            ]
+            if intent.market == "handicap":
+                exact_candidates = [
+                    item
+                    for item in candidates
+                    if item.get("line") is not None
+                    and item.get("line_diff") is not None
+                    and float(item["line_diff"]) <= 0.01
+                    and bool(item.get("scope_match", False))
+                    and float(item["score"]) > 0.0
+                ]
+            else:
+                exact_candidates = [
+                    item
+                    for item in candidates
+                    if item.get("line") is not None
+                    and item.get("line_diff") is not None
+                    and float(item["line_diff"]) <= 0.01
+                    and float(item["score"]) > 0.0
+                ]
             if exact_candidates:
                 exact_candidates.sort(key=lambda item: item["score"], reverse=True)
                 best = exact_candidates[0]
             else:
-                nearest = sorted(
-                    [item for item in candidates if item.get("line") is not None],
-                    key=lambda item: float(item.get("line_diff") or 9999.0),
-                )
+                nearest_pool = [item for item in candidates if item.get("line") is not None]
+                if intent.market == "handicap":
+                    nearest = sorted(
+                        nearest_pool,
+                        key=lambda item: (
+                            0 if bool(item.get("scope_match", False)) else 1,
+                            float(item.get("line_diff") or 9999.0),
+                        ),
+                    )
+                else:
+                    nearest = sorted(
+                        nearest_pool,
+                        key=lambda item: float(item.get("line_diff") or 9999.0),
+                    )
                 raise BlogabetPublishError(
                     "find_market",
                     f"Точная линия не найдена (нужна {intent.line})",

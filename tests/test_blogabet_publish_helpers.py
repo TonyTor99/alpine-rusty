@@ -1,8 +1,14 @@
+import base64
 from types import SimpleNamespace
+from urllib.parse import quote
 
 from bet_intent import BetIntent
 from blogabet_publisher import (
     _detect_match_sport_key,
+    _contains_handicap_marker,
+    _coupon_matches_intent,
+    _line_diff_for_market,
+    _parse_odd_button_onclick_payload,
     _clean_team_label,
     build_league_selection_plan,
     is_recoverable_submit_error,
@@ -24,6 +30,26 @@ def _intent(*, market: str, period: str) -> BetIntent:
         current_score=None,
         raw_text="",
     )
+
+
+def _moneyline_intent(side: str = "home") -> BetIntent:
+    return BetIntent(
+        metric="goals",
+        period="ft",
+        scope="match",
+        market="moneyline",
+        side=side,
+        line=None,
+        is_live=False,
+        current_score=None,
+        raw_text="П1",
+    )
+
+
+def _onclick_with_payload(body: str) -> str:
+    serialized = f's:{len(body)}:"{body}";'
+    encoded = base64.b64encode(serialized.encode("utf-8")).decode("ascii")
+    return f"return updateCoupon('{quote(encoded, safe='')}',this)"
 
 
 def test_clean_team_label_strips_corners_bookings_suffixes() -> None:
@@ -129,3 +155,65 @@ def test_detect_match_sport_key_from_markers() -> None:
         href="",
     )
     assert _detect_match_sport_key(match, intent) == "basketball"
+
+
+def test_coupon_moneyline_rejects_handicap_coupon_text() -> None:
+    ok, diag = _coupon_matches_intent(
+        "Full Event Home +0.75 (AH) (1 - 0) @ 1.568",
+        _moneyline_intent("home"),
+    )
+    assert ok is False
+    assert diag["intent_has_handicap_marker"] is True
+
+
+def test_coupon_moneyline_accepts_plain_home_text() -> None:
+    ok, diag = _coupon_matches_intent(
+        "Full Event Home @ 1.568",
+        _moneyline_intent("home"),
+    )
+    assert ok is True
+    assert diag["intent_has_handicap_marker"] is False
+
+
+def test_coupon_moneyline_with_live_score_is_not_handicap() -> None:
+    ok, diag = _coupon_matches_intent(
+        "live Japan - North Korea FT Home (1 - 0) Odd: 1.219 Bookmaker: Pinnacle",
+        _moneyline_intent("home"),
+    )
+    assert ok is True
+    assert diag["intent_has_handicap_marker"] is False
+
+
+def test_contains_handicap_marker_detects_signed_line() -> None:
+    assert _contains_handicap_marker("H +0.75 1.568") is True
+    assert _contains_handicap_marker("A -0.25 2.620") is True
+    assert _contains_handicap_marker("live score 1 - 0") is False
+
+
+def test_parse_odd_button_onclick_payload_moneyline() -> None:
+    onclick = _onclick_with_payload(
+        "isLive=true^|^marketName=moneyline^|^pick=Home^|^odd=1.149^|^extra=moneyline:home"
+    )
+    parsed = _parse_odd_button_onclick_payload(onclick)
+    assert parsed["market_name"] == "moneyline"
+    assert parsed["pick"] == "home"
+
+
+def test_parse_odd_button_onclick_payload_spreads_line() -> None:
+    onclick = _onclick_with_payload(
+        "isLive=true^|^marketName=spreads^|^pick=Away^|^line=-0.75^|^extra=spreads:away:hdp"
+    )
+    parsed = _parse_odd_button_onclick_payload(onclick)
+    assert parsed["market_name"] == "spreads"
+    assert parsed["pick"] == "away"
+    assert parsed["line"] == -0.75
+
+
+def test_line_diff_for_market_handicap_uses_absolute_line_value() -> None:
+    assert _line_diff_for_market("handicap", +1.0, +1.0) == 0.0
+    assert _line_diff_for_market("handicap", -1.0, +1.0) == 0.0
+    assert _line_diff_for_market("handicap", -0.75, +1.0) == 0.25
+
+
+def test_line_diff_for_market_total_keeps_sign() -> None:
+    assert _line_diff_for_market("total", -1.0, +1.0) == 2.0
