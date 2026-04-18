@@ -311,6 +311,8 @@ class ParserSource:
     chat_id: str = ""
     vk_chat_ids: tuple[str, ...] = ()
     enabled: bool = True
+    telegram_enabled: bool = True
+    vk_enabled: bool = True
     blogabet_enabled: bool = True
 
 
@@ -932,9 +934,9 @@ def compose_platform_delivery_key(
 
 def iter_source_delivery_targets(source: ParserSource) -> list[tuple[str, str]]:
     targets: list[tuple[str, str]] = []
-    if is_telegram_delivery_enabled() and normalize_chat_id(source.chat_id):
+    if source.telegram_enabled and is_telegram_delivery_enabled() and normalize_chat_id(source.chat_id):
         targets.append(("telegram", source.chat_id))
-    if is_vk_delivery_enabled():
+    if source.vk_enabled and is_vk_delivery_enabled():
         for chat_id in source.vk_chat_ids:
             targets.append(("vk", chat_id))
     return targets
@@ -2056,6 +2058,8 @@ def clone_parser_sources(sources: list[ParserSource]) -> list[ParserSource]:
             chat_id=source.chat_id,
             vk_chat_ids=tuple(source.vk_chat_ids),
             enabled=source.enabled,
+            telegram_enabled=source.telegram_enabled,
+            vk_enabled=source.vk_enabled,
             blogabet_enabled=source.blogabet_enabled,
         )
         for source in sources
@@ -2072,6 +2076,8 @@ def write_parser_sources_to_storage(sources: list[ParserSource]) -> None:
             "vk_chat_ids": list(source.vk_chat_ids),
             "vk_chat_id": source.vk_chat_ids[0] if source.vk_chat_ids else "",
             "enabled": source.enabled,
+            "telegram_enabled": source.telegram_enabled,
+            "vk_enabled": source.vk_enabled,
             "blogabet_enabled": source.blogabet_enabled,
         }
         for source in sources
@@ -2135,6 +2141,22 @@ def load_parser_sources_from_storage() -> list[ParserSource]:
             continue
 
         source_enabled = bool(item.get("enabled", True))
+        raw_telegram_enabled = item.get("telegram_enabled", True)
+        if isinstance(raw_telegram_enabled, bool):
+            source_telegram_enabled = raw_telegram_enabled
+        else:
+            source_telegram_enabled = parse_bool_env(
+                str(raw_telegram_enabled),
+                default=True,
+            )
+        raw_vk_enabled = item.get("vk_enabled", True)
+        if isinstance(raw_vk_enabled, bool):
+            source_vk_enabled = raw_vk_enabled
+        else:
+            source_vk_enabled = parse_bool_env(
+                str(raw_vk_enabled),
+                default=True,
+            )
         raw_blogabet_enabled = item.get("blogabet_enabled", True)
         if isinstance(raw_blogabet_enabled, bool):
             source_blogabet_enabled = raw_blogabet_enabled
@@ -2151,6 +2173,8 @@ def load_parser_sources_from_storage() -> list[ParserSource]:
                 chat_id=chat_id_raw,
                 vk_chat_ids=vk_chat_ids,
                 enabled=source_enabled,
+                telegram_enabled=source_telegram_enabled,
+                vk_enabled=source_vk_enabled,
                 blogabet_enabled=source_blogabet_enabled,
             )
         )
@@ -2198,6 +2222,8 @@ def add_parser_source(url: str, chat_id: str, vk_chat_ids_raw: str = "") -> tupl
                     chat_id=source.chat_id,
                     vk_chat_ids=source.vk_chat_ids,
                     enabled=source.enabled,
+                    telegram_enabled=source.telegram_enabled,
+                    vk_enabled=source.vk_enabled,
                     blogabet_enabled=source.blogabet_enabled,
                 )
                 break
@@ -2209,6 +2235,8 @@ def add_parser_source(url: str, chat_id: str, vk_chat_ids_raw: str = "") -> tupl
                 chat_id=normalized_chat_id,
                 vk_chat_ids=vk_chat_ids,
                 enabled=True,
+                telegram_enabled=True,
+                vk_enabled=True,
                 blogabet_enabled=True,
             )
             state.parser_sources.append(source)
@@ -2233,6 +2261,8 @@ def toggle_parser_source(source_id: str) -> ParserSource:
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                telegram_enabled=source.telegram_enabled,
+                vk_enabled=source.vk_enabled,
                 blogabet_enabled=source.blogabet_enabled,
             )
             break
@@ -2256,6 +2286,58 @@ def toggle_parser_source_blogabet(source_id: str) -> ParserSource:
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                telegram_enabled=source.telegram_enabled,
+                vk_enabled=source.vk_enabled,
+                blogabet_enabled=source.blogabet_enabled,
+            )
+            break
+        else:
+            raise ValueError("Ссылка не найдена")
+
+    persist_parser_sources_snapshot(snapshot)
+    return toggled
+
+
+def toggle_parser_source_telegram(source_id: str) -> ParserSource:
+    with state.lock:
+        for source in state.parser_sources:
+            if source.source_id != source_id:
+                continue
+            source.telegram_enabled = not source.telegram_enabled
+            snapshot = clone_parser_sources(state.parser_sources)
+            toggled = ParserSource(
+                source_id=source.source_id,
+                url=source.url,
+                chat_id=source.chat_id,
+                vk_chat_ids=source.vk_chat_ids,
+                enabled=source.enabled,
+                telegram_enabled=source.telegram_enabled,
+                vk_enabled=source.vk_enabled,
+                blogabet_enabled=source.blogabet_enabled,
+            )
+            break
+        else:
+            raise ValueError("Ссылка не найдена")
+
+    persist_parser_sources_snapshot(snapshot)
+    return toggled
+
+
+def toggle_parser_source_vk(source_id: str) -> ParserSource:
+    with state.lock:
+        for source in state.parser_sources:
+            if source.source_id != source_id:
+                continue
+            source.vk_enabled = not source.vk_enabled
+            snapshot = clone_parser_sources(state.parser_sources)
+            toggled = ParserSource(
+                source_id=source.source_id,
+                url=source.url,
+                chat_id=source.chat_id,
+                vk_chat_ids=source.vk_chat_ids,
+                enabled=source.enabled,
+                telegram_enabled=source.telegram_enabled,
+                vk_enabled=source.vk_enabled,
                 blogabet_enabled=source.blogabet_enabled,
             )
             break
@@ -2296,6 +2378,8 @@ def update_parser_source_chat_id(source_id: str, chat_id: str) -> ParserSource:
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                telegram_enabled=source.telegram_enabled,
+                vk_enabled=source.vk_enabled,
                 blogabet_enabled=source.blogabet_enabled,
             )
             break
@@ -2321,6 +2405,8 @@ def update_parser_source_vk_chat_ids(source_id: str, vk_chat_ids_raw: str) -> Pa
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                telegram_enabled=source.telegram_enabled,
+                vk_enabled=source.vk_enabled,
                 blogabet_enabled=source.blogabet_enabled,
             )
             break
@@ -6581,6 +6667,8 @@ async def parser_worker_async(
                                     chat_id=source.chat_id,
                                     vk_chat_ids=tuple(source.vk_chat_ids),
                                     enabled=True,
+                                    telegram_enabled=source.telegram_enabled,
+                                    vk_enabled=source.vk_enabled,
                                     blogabet_enabled=source.blogabet_enabled,
                                 )
                                 for source in state.parser_sources
@@ -7805,6 +7893,12 @@ TEMPLATE = """
                 <span class="source-state {% if not source.enabled %}off{% endif %}">
                   {% if source.enabled %}Ссылка: Включена{% else %}Ссылка: Выключена{% endif %}
                 </span>
+                <span class="source-state {% if not source.telegram_enabled %}off{% endif %}">
+                  {% if source.telegram_enabled %}TG: ON{% else %}TG: OFF{% endif %}
+                </span>
+                <span class="source-state {% if not source.vk_enabled %}off{% endif %}">
+                  {% if source.vk_enabled %}VK: ON{% else %}VK: OFF{% endif %}
+                </span>
                 <span class="source-state {% if not source.blogabet_enabled %}off{% endif %}">
                   {% if source.blogabet_enabled %}Blogabet: Включен{% else %}Blogabet: Выключен{% endif %}
                 </span>
@@ -7814,6 +7908,18 @@ TEMPLATE = """
                   <input type="hidden" name="source_id" value="{{ source.source_id }}" />
                   <button class="secondary mini" type="submit" {% if not can_manage_parser %}disabled{% endif %}>
                     {% if source.enabled %}Выключить{% else %}Включить{% endif %}
+                  </button>
+                </form>
+                <form method="post" action="{{ url_for('toggle_parser_source_telegram_route') }}">
+                  <input type="hidden" name="source_id" value="{{ source.source_id }}" />
+                  <button class="secondary mini" type="submit" {% if not can_manage_parser %}disabled{% endif %}>
+                    {% if source.telegram_enabled %}TG OFF{% else %}TG ON{% endif %}
+                  </button>
+                </form>
+                <form method="post" action="{{ url_for('toggle_parser_source_vk_route') }}">
+                  <input type="hidden" name="source_id" value="{{ source.source_id }}" />
+                  <button class="secondary mini" type="submit" {% if not can_manage_parser %}disabled{% endif %}>
+                    {% if source.vk_enabled %}VK OFF{% else %}VK ON{% endif %}
                   </button>
                 </form>
                 <form method="post" action="{{ url_for('toggle_parser_source_blogabet_route') }}">
@@ -8724,6 +8830,66 @@ def toggle_parser_source_blogabet_route():
     return redirect(url_for("index"))
 
 
+@app.post("/toggle-parser-source-telegram")
+def toggle_parser_source_telegram_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    source_id = request.form.get("source_id", "").strip()
+    if not source_id:
+        with state.lock:
+            state.error = "Не передан идентификатор ссылки"
+        return redirect(url_for("index"))
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+
+        source = toggle_parser_source_telegram(source_id)
+        status_label = "включена" if source.telegram_enabled else "выключена"
+        with state.lock:
+            state.info = f"Доставка в Telegram для ссылки {status_label}: {source.url}"
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось изменить доставку Telegram для ссылки: {exc}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/toggle-parser-source-vk")
+def toggle_parser_source_vk_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    source_id = request.form.get("source_id", "").strip()
+    if not source_id:
+        with state.lock:
+            state.error = "Не передан идентификатор ссылки"
+        return redirect(url_for("index"))
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+
+        source = toggle_parser_source_vk(source_id)
+        status_label = "включена" if source.vk_enabled else "выключена"
+        with state.lock:
+            state.info = f"Доставка в VK для ссылки {status_label}: {source.url}"
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось изменить доставку VK для ссылки: {exc}"
+
+    return redirect(url_for("index"))
+
+
 @app.post("/delete-parser-source")
 def delete_parser_source_route():
     with state.lock:
@@ -8974,12 +9140,19 @@ def analyze_stats_delivery_sources(sources: list[ParserSource]) -> tuple[bool, b
     sources_without_targets: list[str] = []
     has_telegram_targets = False
     has_vk_targets = False
+    has_sources_with_delivery_enabled = False
 
     for source in sources:
+        source_telegram_enabled = telegram_delivery_enabled and source.telegram_enabled
+        source_vk_enabled = vk_delivery_enabled and source.vk_enabled
+        if not source_telegram_enabled and not source_vk_enabled:
+            continue
+
+        has_sources_with_delivery_enabled = True
         source_has_target = False
 
         normalized_tg_chat_id = normalize_chat_id(source.chat_id)
-        if telegram_delivery_enabled and normalized_tg_chat_id:
+        if source_telegram_enabled and normalized_tg_chat_id:
             try:
                 validate_chat_id(normalized_tg_chat_id)
                 has_telegram_targets = True
@@ -8987,7 +9160,7 @@ def analyze_stats_delivery_sources(sources: list[ParserSource]) -> tuple[bool, b
             except Exception:  # noqa: BLE001
                 invalid_tg_sources.append(source.url)
 
-        if vk_delivery_enabled:
+        if source_vk_enabled:
             for raw_vk_chat_id in source.vk_chat_ids:
                 try:
                     validate_vk_chat_id(raw_vk_chat_id)
@@ -8999,6 +9172,12 @@ def analyze_stats_delivery_sources(sources: list[ParserSource]) -> tuple[bool, b
 
         if not source_has_target:
             sources_without_targets.append(source.url)
+
+    if not has_sources_with_delivery_enabled:
+        raise RuntimeError(
+            "Для включенных ссылок отключена отправка в Telegram/VK "
+            "(глобально или в настройках конкретной ссылки)"
+        )
 
     if invalid_tg_sources:
         unique_sources = list(dict.fromkeys(invalid_tg_sources))
@@ -9056,6 +9235,8 @@ def send_daily_stats_test_route():
                     chat_id=source.chat_id,
                     vk_chat_ids=tuple(source.vk_chat_ids),
                     enabled=True,
+                    telegram_enabled=source.telegram_enabled,
+                    vk_enabled=source.vk_enabled,
                     blogabet_enabled=source.blogabet_enabled,
                 )
                 for source in state.parser_sources
@@ -9133,6 +9314,8 @@ def send_weekly_stats_test_route():
                     chat_id=source.chat_id,
                     vk_chat_ids=tuple(source.vk_chat_ids),
                     enabled=True,
+                    telegram_enabled=source.telegram_enabled,
+                    vk_enabled=source.vk_enabled,
                     blogabet_enabled=source.blogabet_enabled,
                 )
                 for source in state.parser_sources
@@ -9212,6 +9395,8 @@ def send_monthly_stats_test_route():
                     chat_id=source.chat_id,
                     vk_chat_ids=tuple(source.vk_chat_ids),
                     enabled=True,
+                    telegram_enabled=source.telegram_enabled,
+                    vk_enabled=source.vk_enabled,
                     blogabet_enabled=source.blogabet_enabled,
                 )
                 for source in state.parser_sources
@@ -9275,10 +9460,12 @@ def collect_unique_enabled_chat_ids() -> list[str]:
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                telegram_enabled=source.telegram_enabled,
+                vk_enabled=source.vk_enabled,
                 blogabet_enabled=source.blogabet_enabled,
             )
             for source in state.parser_sources
-            if source.enabled and normalize_chat_id(source.chat_id)
+            if source.enabled and source.telegram_enabled and normalize_chat_id(source.chat_id)
         ]
 
     if not raw_sources_with_chat:
@@ -9308,10 +9495,12 @@ def collect_unique_enabled_vk_chat_ids() -> list[str]:
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                telegram_enabled=source.telegram_enabled,
+                vk_enabled=source.vk_enabled,
                 blogabet_enabled=source.blogabet_enabled,
             )
             for source in state.parser_sources
-            if source.enabled and source.vk_chat_ids
+            if source.enabled and source.vk_enabled and source.vk_chat_ids
         ]
 
     if not raw_sources:

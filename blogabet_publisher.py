@@ -1903,33 +1903,83 @@ class BlogabetPublisher:
     };
   };
 
-  const anyNode = document.querySelector("#auto_accept_any");
-  const betterNode = document.querySelector("#auto_accept_better");
+  const pickNode = (selectors) => {
+    const nodes = Array.from(document.querySelectorAll(selectors.join(", ")));
+    const active = nodes.find((node) => !node.disabled && node.offsetParent !== null)
+      || nodes.find((node) => !node.disabled)
+      || nodes[0]
+      || null;
+    return { active, total: nodes.length };
+  };
+
+  const anyPick = pickNode([
+    "#_couponBox input#auto_accept_any",
+    "#_couponBox input[name='auto_accept_any']",
+    "input#auto_accept_any",
+    "input[name='auto_accept_any']",
+  ]);
+  const betterPick = pickNode([
+    "#_couponBox input#auto_accept_better",
+    "#_couponBox input[name='auto_accept_better']",
+    "input#auto_accept_better",
+    "input[name='auto_accept_better']",
+  ]);
+  const anyNode = anyPick.active;
+  const betterNode = betterPick.active;
   const before = {
     any: getState(anyNode),
     better: getState(betterNode),
   };
 
   const setChecked = (node, checked) => {
-    if (!node || node.disabled) return;
-    node.checked = !!checked;
+    if (!node || node.disabled) return false;
+    const target = !!checked;
+    if (!!node.checked === target) return true;
+
+    try { node.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_err) {}
+    try { node.focus({ preventScroll: true }); } catch (_err) {}
+    try { node.click(); } catch (_err) {}
+
+    if (!!node.checked !== target) {
+      const label = node.closest("label") || (node.id ? document.querySelector("label[for='" + node.id + "']") : null);
+      if (label) {
+        try { label.click(); } catch (_err) {}
+      }
+    }
+
+    if (!!node.checked !== target) {
+      node.checked = target;
+    }
     node.dispatchEvent(new Event("input", { bubbles: true }));
     node.dispatchEvent(new Event("change", { bubbles: true }));
+    return !!node.checked === target;
   };
 
   if (allowAny) {
-    setChecked(anyNode, true);
     setChecked(betterNode, false);
+    setChecked(anyNode, true);
   } else {
-    setChecked(betterNode, true);
     setChecked(anyNode, false);
+    setChecked(betterNode, true);
   }
 
   const after = {
     any: getState(anyNode),
     better: getState(betterNode),
   };
-  return { before, after, allow_any: !!allowAny };
+  const success = allowAny
+    ? (!!after.any && after.any.checked === true && (!after.better || after.better.checked === false))
+    : (!!after.better && after.better.checked === true && (!after.any || after.any.checked === false));
+  return {
+    before,
+    after,
+    allow_any: !!allowAny,
+    success,
+    candidates: {
+      any: anyPick.total,
+      better: betterPick.total,
+    },
+  };
 }
 """,
             {"allowAny": bool(allow_any)},
@@ -1937,6 +1987,33 @@ class BlogabetPublisher:
         if isinstance(result, dict):
             return result
         return {"allow_any": bool(allow_any)}
+
+    async def _ensure_auto_accept_policy(
+        self,
+        page: AsyncPage,
+        *,
+        allow_any: bool,
+        step_name: str,
+        attempts: int = 4,
+    ) -> dict[str, Any]:
+        last_result: dict[str, Any] = {"allow_any": bool(allow_any)}
+        for attempt in range(1, attempts + 1):
+            current = await self._set_auto_accept_policy(page, allow_any=allow_any)
+            if isinstance(current, dict):
+                current["attempt"] = attempt
+                last_result = current
+            else:
+                last_result = {"allow_any": bool(allow_any), "attempt": attempt}
+
+            if bool(last_result.get("success", False)):
+                return last_result
+            await page.wait_for_timeout(180 + attempt * 120)
+
+        raise BlogabetPublishError(
+            step_name,
+            "Не удалось гарантированно выставить auto-accept odds перед публикацией",
+            diagnostics={"auto_accept_policy": last_result},
+        )
 
     async def _clear_coupon(
         self,
@@ -2456,6 +2533,11 @@ class BlogabetPublisher:
                 if create_button is None:
                     diagnostics["create_pick_candidates"] = await self._collect_create_pick_candidates(page)
                     raise BlogabetPublishError("submit_pick", "Кнопка Create pick не найдена")
+                diagnostics["auto_accept_policy_before_submit"] = await self._ensure_auto_accept_policy(
+                    page,
+                    allow_any=True,
+                    step_name="submit_pick",
+                )
                 start_url = page.url
                 await create_button.scroll_into_view_if_needed()
                 await create_button.click()
@@ -2563,6 +2645,13 @@ class BlogabetPublisher:
                                     "submit_pick",
                                     "Кнопка Create pick не найдена после recovery",
                                 )
+                            diagnostics[f"auto_accept_policy_before_retry_submit_{recovery_attempt}"] = (
+                                await self._ensure_auto_accept_policy(
+                                    page,
+                                    allow_any=True,
+                                    step_name="submit_pick",
+                                )
+                            )
                             retry_start_url = page.url
                             await retry_button.scroll_into_view_if_needed()
                             await retry_button.click()
