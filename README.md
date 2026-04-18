@@ -45,6 +45,8 @@ python3 app.py
 - `TELEGRAM_USE_SYSTEM_PROXY` — использовать системные прокси для Telegram API (`0/1`), по умолчанию `0`.
 - `PARSER_INTERVAL_SECONDS` — интервал проверки, минимум `10`.
 - `PARSER_SEND_EXISTING_ON_START` — отправлять существующие матчи при старте (`1`) или считать их уже отправленными (`0`).
+- `PARSER_DELIVERY_TELEGRAM_ENABLED` — отправлять сигналы в Telegram (`1`) или только собирать без отправки (`0`).
+- `PARSER_DELIVERY_VK_ENABLED` — отправлять сигналы в VK (`1`) или только собирать без отправки (`0`).
 - `TARGET_HEADLESS` — `0/1`.
 - `APP_LOG_LEVEL` — `DEBUG/INFO/WARNING/ERROR`.
 - `BLOGABET_ADMIN_TG_CHAT_ID` — chat_id для админ-алертов по сбоям Blogabet. Можно несколько через запятую/`;`/перенос строки.

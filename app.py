@@ -171,6 +171,8 @@ DEFAULT_BLOGABET_STORAGE_STATE_PATH = "./blogabet_state.json"
 DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH = "./blogabet_league_aliases.json"
 DEFAULT_BLOGABET_STAKE = 3
 BLOGABET_LEAGUE_ALIASES_FORMAT_VERSION = 1
+PARSER_DELIVERY_TELEGRAM_ENABLED_ENV = "PARSER_DELIVERY_TELEGRAM_ENABLED"
+PARSER_DELIVERY_VK_ENABLED_ENV = "PARSER_DELIVERY_VK_ENABLED"
 
 
 @dataclass
@@ -561,6 +563,28 @@ def parse_bool_env(value: str, default: bool = False) -> bool:
     return normalized in {"1", "true", "yes", "y", "on"}
 
 
+def is_telegram_delivery_enabled() -> bool:
+    return parse_bool_env(
+        os.getenv(PARSER_DELIVERY_TELEGRAM_ENABLED_ENV, "1"),
+        default=True,
+    )
+
+
+def is_vk_delivery_enabled() -> bool:
+    return parse_bool_env(
+        os.getenv(PARSER_DELIVERY_VK_ENABLED_ENV, "1"),
+        default=True,
+    )
+
+
+def is_delivery_enabled_for_target(target_kind: str) -> bool:
+    if target_kind == "telegram":
+        return is_telegram_delivery_enabled()
+    if target_kind == "vk":
+        return is_vk_delivery_enabled()
+    return True
+
+
 def upsert_env_value(key: str, value: str, env_path: Optional[Path] = None) -> None:
     target_path = env_path or (Path(__file__).resolve().parent / ".env")
     line_re = re.compile(rf"^\\s*{re.escape(key)}=")
@@ -908,10 +932,11 @@ def compose_platform_delivery_key(
 
 def iter_source_delivery_targets(source: ParserSource) -> list[tuple[str, str]]:
     targets: list[tuple[str, str]] = []
-    if normalize_chat_id(source.chat_id):
+    if is_telegram_delivery_enabled() and normalize_chat_id(source.chat_id):
         targets.append(("telegram", source.chat_id))
-    for chat_id in source.vk_chat_ids:
-        targets.append(("vk", chat_id))
+    if is_vk_delivery_enabled():
+        for chat_id in source.vk_chat_ids:
+            targets.append(("vk", chat_id))
     return targets
 
 
@@ -5280,7 +5305,7 @@ async def fetch_matches_for_source(
 
 async def deliver_match_notification(
     tg_session: aiohttp.ClientSession,
-    tg_cfg: TelegramConfig,
+    tg_cfg: Optional[TelegramConfig],
     vk_session: Optional[aiohttp.ClientSession],
     vk_cfg: Optional[VkConfig],
     blogabet_publisher: Optional[BlogabetPublisher],
@@ -5301,6 +5326,8 @@ async def deliver_match_notification(
 
     try:
         if target_kind == "telegram":
+            if tg_cfg is None:
+                raise RuntimeError("Telegram доставка отключена или конфигурация недоступна")
             if not normalize_text(match.image_url):
                 raise RuntimeError("У матча отсутствует обязательное изображение")
             message_id = await send_telegram_match_message(
@@ -5438,7 +5465,7 @@ async def deliver_match_notification(
                     admin_exc,
                 )
 
-            if admin_chat_ids:
+            if admin_chat_ids and tg_cfg is not None:
                 alert_message = build_blogabet_admin_alert_message(
                     match,
                     blogabet_bet_raw,
@@ -5457,6 +5484,10 @@ async def deliver_match_notification(
                             "Не удалось отправить алерт админу о сбое Blogabet. chat_id=%s",
                             admin_chat_id,
                         )
+            elif admin_chat_ids and tg_cfg is None:
+                log_blogabet_error(
+                    "Админ-алерты Blogabet пропущены: Telegram доставка отключена или конфигурация недоступна"
+                )
 
         with state.lock:
             state.parser_error = (
@@ -5643,7 +5674,7 @@ async def deliver_settlement_update(
 async def schedule_settlement_updates_for_source(
     parser_context: Any,
     tg_session: aiohttp.ClientSession,
-    tg_cfg: TelegramConfig,
+    tg_cfg: Optional[TelegramConfig],
     match_store: MatchTrackingStore,
     cfg: TargetConfig,
     source: ParserSource,
@@ -5677,6 +5708,10 @@ async def schedule_settlement_updates_for_source(
         )
 
     if not candidates and not has_disappeared and not should_check_completed_now:
+        return 0
+
+    if tg_cfg is None:
+        release_pending_settlement_keys([record.delivery_key for record in candidates])
         return 0
 
     if not should_check_completed_now and not completed_fetch_due:
@@ -6402,20 +6437,32 @@ async def parser_worker_async(
     storage_state: dict[str, Any],
 ) -> None:
     logger.info("Запуск фонового парсера (async)")
-    try:
-        tg_cfg = load_telegram_config()
-    except Exception as exc:  # noqa: BLE001
-        with state.lock:
-            state.parser_error = f"Ошибка Telegram конфигурации: {exc}"
-            state.parser_running = False
-            state.parser_thread = None
-            state.parser_stop_event = None
-        return
-    try:
-        vk_cfg: Optional[VkConfig] = load_vk_config()
-    except Exception as exc:  # noqa: BLE001
-        vk_cfg = None
-        logger.warning("VK конфигурация недоступна: %s", exc)
+    telegram_delivery_enabled = is_telegram_delivery_enabled()
+    vk_delivery_enabled = is_vk_delivery_enabled()
+
+    tg_cfg: Optional[TelegramConfig] = None
+    if telegram_delivery_enabled:
+        try:
+            tg_cfg = load_telegram_config()
+        except Exception as exc:  # noqa: BLE001
+            with state.lock:
+                state.parser_error = f"Ошибка Telegram конфигурации: {exc}"
+                state.parser_running = False
+                state.parser_thread = None
+                state.parser_stop_event = None
+            return
+    else:
+        logger.info("Telegram доставка выключена глобально: %s=0", PARSER_DELIVERY_TELEGRAM_ENABLED_ENV)
+
+    vk_cfg: Optional[VkConfig] = None
+    if vk_delivery_enabled:
+        try:
+            vk_cfg = load_vk_config()
+        except Exception as exc:  # noqa: BLE001
+            vk_cfg = None
+            logger.warning("VK конфигурация недоступна: %s", exc)
+    else:
+        logger.info("VK доставка выключена глобально: %s=0", PARSER_DELIVERY_VK_ENABLED_ENV)
 
     blogabet_requested = parse_bool_env(os.getenv("BLOGABET_ENABLED", "0"), default=False)
     blogabet_cfg: Optional[BlogabetConfig] = None
@@ -6497,10 +6544,12 @@ async def parser_worker_async(
         if blogabet_cfg is not None and ocr_client is not None:
             blogabet_publisher = BlogabetPublisher(blogabet_cfg, logger=logger)
 
-        tg_timeout = aiohttp.ClientTimeout(total=tg_cfg.request_timeout_seconds)
+        tg_timeout = aiohttp.ClientTimeout(
+            total=(tg_cfg.request_timeout_seconds if tg_cfg is not None else DEFAULT_TELEGRAM_REQUEST_TIMEOUT_SECONDS)
+        )
         async with aiohttp.ClientSession(
             timeout=tg_timeout,
-            trust_env=tg_cfg.use_system_proxy,
+            trust_env=(tg_cfg.use_system_proxy if tg_cfg is not None else False),
         ) as tg_session:
             vk_session: Optional[aiohttp.ClientSession] = None
             try:
@@ -7689,6 +7738,30 @@ TEMPLATE = """
             <div class="hint">Настройка применяется при следующем запуске парсера.</div>
           </article>
 
+          <article class="tile">
+            <h3>Доставка в Telegram</h3>
+            <form method="post" action="{{ url_for('update_parser_delivery_telegram_mode') }}">
+              <select name="parser_delivery_telegram_enabled" required>
+                <option value="1" {% if parser_delivery_telegram_enabled %}selected{% endif %}>Включена</option>
+                <option value="0" {% if not parser_delivery_telegram_enabled %}selected{% endif %}>Выключена</option>
+              </select>
+              <button class="secondary" type="submit" {% if not can_manage_parser %}disabled{% endif %}>Сохранить</button>
+            </form>
+            <div class="hint">При выключении парсер продолжит сбор матчей, но Telegram-отправка выполняться не будет. Изменение применяется после перезапуска парсера.</div>
+          </article>
+
+          <article class="tile">
+            <h3>Доставка в VK</h3>
+            <form method="post" action="{{ url_for('update_parser_delivery_vk_mode') }}">
+              <select name="parser_delivery_vk_enabled" required>
+                <option value="1" {% if parser_delivery_vk_enabled %}selected{% endif %}>Включена</option>
+                <option value="0" {% if not parser_delivery_vk_enabled %}selected{% endif %}>Выключена</option>
+              </select>
+              <button class="secondary" type="submit" {% if not can_manage_parser %}disabled{% endif %}>Сохранить</button>
+            </form>
+            <div class="hint">При выключении парсер продолжит сбор матчей, но VK-отправка выполняться не будет. Изменение применяется после перезапуска парсера.</div>
+          </article>
+
           <article class="tile full">
             <h3>Авторассылки</h3>
             <div class="hint">Суточная: каждый день в {{ daily_stats_send_hour_msk }}:00 МСК (за предыдущие сутки).</div>
@@ -8077,6 +8150,8 @@ def index():
     default_interval = DEFAULT_PARSER_INTERVAL_SECONDS
     default_parser_page_max_age_seconds = DEFAULT_PARSER_PAGE_MAX_AGE_SECONDS
     default_parser_send_existing_on_start = True
+    default_parser_delivery_telegram_enabled = is_telegram_delivery_enabled()
+    default_parser_delivery_vk_enabled = is_vk_delivery_enabled()
     default_daily_stats_send_hour_msk = DEFAULT_DAILY_STATS_SEND_HOUR_MSK
     default_weekly_stats_send_hour_msk = DEFAULT_WEEKLY_STATS_SEND_HOUR_MSK
     default_monthly_stats_send_hour_msk = DEFAULT_MONTHLY_STATS_SEND_HOUR_MSK
@@ -8243,6 +8318,8 @@ def index():
             parser_interval_seconds=parser_interval_seconds,
             parser_page_max_age_seconds=parser_page_max_age_seconds,
             parser_send_existing_on_start=default_parser_send_existing_on_start,
+            parser_delivery_telegram_enabled=default_parser_delivery_telegram_enabled,
+            parser_delivery_vk_enabled=default_parser_delivery_vk_enabled,
             daily_stats_send_hour_msk=default_daily_stats_send_hour_msk,
             weekly_stats_send_hour_msk=default_weekly_stats_send_hour_msk,
             monthly_stats_send_hour_msk=default_monthly_stats_send_hour_msk,
@@ -8403,7 +8480,11 @@ def start_parser():
     try:
         cfg = load_target_config()
         ensure_parser_runtime_defaults(cfg)
-        load_telegram_config()
+        telegram_delivery_enabled = is_telegram_delivery_enabled()
+        vk_delivery_enabled = is_vk_delivery_enabled()
+
+        if telegram_delivery_enabled:
+            load_telegram_config()
 
         with state.lock:
             is_ready = state.step == "ready" and state.auth_storage_state is not None
@@ -8419,29 +8500,31 @@ def start_parser():
         sources_with_invalid_vk_chat: list[str] = []
         requires_vk_delivery = False
         for source in enabled_sources:
-            try:
-                validate_chat_id(source.chat_id)
-            except Exception:  # noqa: BLE001
-                sources_with_invalid_chat.append(source.url)
-            if source.vk_chat_ids:
-                requires_vk_delivery = True
-            for chat_id in source.vk_chat_ids:
+            if telegram_delivery_enabled:
                 try:
-                    validate_vk_chat_id(chat_id)
+                    validate_chat_id(source.chat_id)
                 except Exception:  # noqa: BLE001
-                    sources_with_invalid_vk_chat.append(source.url)
-                    break
-        if sources_with_invalid_chat:
+                    sources_with_invalid_chat.append(source.url)
+            if vk_delivery_enabled and source.vk_chat_ids:
+                requires_vk_delivery = True
+            if vk_delivery_enabled:
+                for chat_id in source.vk_chat_ids:
+                    try:
+                        validate_vk_chat_id(chat_id)
+                    except Exception:  # noqa: BLE001
+                        sources_with_invalid_vk_chat.append(source.url)
+                        break
+        if telegram_delivery_enabled and sources_with_invalid_chat:
             raise RuntimeError(
                 "Для некоторых ссылок некорректный chat_id Telegram: "
                 + " | ".join(sources_with_invalid_chat)
             )
-        if sources_with_invalid_vk_chat:
+        if vk_delivery_enabled and sources_with_invalid_vk_chat:
             raise RuntimeError(
                 "Для некоторых ссылок некорректный chat_id VK: "
                 + " | ".join(sources_with_invalid_vk_chat)
             )
-        if requires_vk_delivery:
+        if vk_delivery_enabled and requires_vk_delivery:
             load_vk_config()
 
         with state.lock:
@@ -8453,6 +8536,8 @@ def start_parser():
         with state.lock:
             state.info = (
                 f"Парсер запущен. История матчей очищена. Активных ссылок: {len(enabled_sources)}. "
+                f"Доставка TG: {'ON' if telegram_delivery_enabled else 'OFF'}, "
+                f"VK: {'ON' if vk_delivery_enabled else 'OFF'}. "
                 f"Суточная: {cfg.daily_stats_send_hour_msk:02d}:00 МСК, "
                 f"недельная: Пн {cfg.weekly_stats_send_hour_msk:02d}:00 МСК, "
                 f"месячная: 1-го числа {cfg.monthly_stats_send_hour_msk:02d}:00 МСК."
@@ -8480,9 +8565,12 @@ def add_parser_source_route():
     try:
         with state.lock:
             is_ready = state.step == "ready" and state.auth_storage_state is not None
+            parser_running = state.parser_running
 
         if not is_ready:
             raise RuntimeError("Сначала выполни вход и подтверди код")
+        if parser_running:
+            raise RuntimeError("Останови парсер перед изменением режима доставки Telegram")
 
         is_added, source = add_parser_source(
             source_url,
@@ -8754,9 +8842,12 @@ def update_parser_send_existing_mode():
     try:
         with state.lock:
             is_ready = state.step == "ready" and state.auth_storage_state is not None
+            parser_running = state.parser_running
 
         if not is_ready:
             raise RuntimeError("Сначала выполни вход и подтверди код")
+        if parser_running:
+            raise RuntimeError("Останови парсер перед изменением режима доставки Telegram")
 
         if raw_value not in {"0", "1"}:
             raise ValueError("Нужно выбрать режим 0 или 1")
@@ -8785,6 +8876,84 @@ def update_parser_send_existing_mode():
     return redirect(url_for("index"))
 
 
+@app.post("/update-parser-delivery-telegram")
+def update_parser_delivery_telegram_mode():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    raw_value = normalize_text(request.form.get("parser_delivery_telegram_enabled", ""))
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+            parser_running = state.parser_running
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+        if parser_running:
+            raise RuntimeError("Останови парсер перед изменением режима доставки Telegram")
+
+        if raw_value not in {"0", "1"}:
+            raise ValueError("Нужно выбрать режим 0 или 1")
+
+        enabled = raw_value == "1"
+        value_to_store = "1" if enabled else "0"
+        upsert_env_value(PARSER_DELIVERY_TELEGRAM_ENABLED_ENV, value_to_store)
+        os.environ[PARSER_DELIVERY_TELEGRAM_ENABLED_ENV] = value_to_store
+
+        with state.lock:
+            state.info = (
+                "Отправка в Telegram включена. Режим применится при следующем запуске парсера."
+                if enabled
+                else "Отправка в Telegram выключена. Сигналы продолжат собираться без отправки после перезапуска парсера."
+            )
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось обновить режим доставки Telegram: {exc}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/update-parser-delivery-vk")
+def update_parser_delivery_vk_mode():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    raw_value = normalize_text(request.form.get("parser_delivery_vk_enabled", ""))
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+            parser_running = state.parser_running
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+        if parser_running:
+            raise RuntimeError("Останови парсер перед изменением режима доставки VK")
+
+        if raw_value not in {"0", "1"}:
+            raise ValueError("Нужно выбрать режим 0 или 1")
+
+        enabled = raw_value == "1"
+        value_to_store = "1" if enabled else "0"
+        upsert_env_value(PARSER_DELIVERY_VK_ENABLED_ENV, value_to_store)
+        os.environ[PARSER_DELIVERY_VK_ENABLED_ENV] = value_to_store
+
+        with state.lock:
+            state.info = (
+                "Отправка в VK включена. Режим применится при следующем запуске парсера."
+                if enabled
+                else "Отправка в VK выключена. Сигналы продолжат собираться без отправки после перезапуска парсера."
+            )
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось обновить режим доставки VK: {exc}"
+
+    return redirect(url_for("index"))
+
+
 @app.post("/stop-parser")
 def stop_parser():
     state.stop_parser()
@@ -8795,6 +8964,11 @@ def stop_parser():
 
 
 def analyze_stats_delivery_sources(sources: list[ParserSource]) -> tuple[bool, bool]:
+    telegram_delivery_enabled = is_telegram_delivery_enabled()
+    vk_delivery_enabled = is_vk_delivery_enabled()
+    if not telegram_delivery_enabled and not vk_delivery_enabled:
+        raise RuntimeError("Отправка в Telegram и VK отключена в настройках парсера")
+
     invalid_tg_sources: list[str] = []
     invalid_vk_sources: list[str] = []
     sources_without_targets: list[str] = []
@@ -8805,7 +8979,7 @@ def analyze_stats_delivery_sources(sources: list[ParserSource]) -> tuple[bool, b
         source_has_target = False
 
         normalized_tg_chat_id = normalize_chat_id(source.chat_id)
-        if normalized_tg_chat_id:
+        if telegram_delivery_enabled and normalized_tg_chat_id:
             try:
                 validate_chat_id(normalized_tg_chat_id)
                 has_telegram_targets = True
@@ -8813,14 +8987,15 @@ def analyze_stats_delivery_sources(sources: list[ParserSource]) -> tuple[bool, b
             except Exception:  # noqa: BLE001
                 invalid_tg_sources.append(source.url)
 
-        for raw_vk_chat_id in source.vk_chat_ids:
-            try:
-                validate_vk_chat_id(raw_vk_chat_id)
-                has_vk_targets = True
-                source_has_target = True
-            except Exception:  # noqa: BLE001
-                invalid_vk_sources.append(source.url)
-                break
+        if vk_delivery_enabled:
+            for raw_vk_chat_id in source.vk_chat_ids:
+                try:
+                    validate_vk_chat_id(raw_vk_chat_id)
+                    has_vk_targets = True
+                    source_has_target = True
+                except Exception:  # noqa: BLE001
+                    invalid_vk_sources.append(source.url)
+                    break
 
         if not source_has_target:
             sources_without_targets.append(source.url)
@@ -8839,8 +9014,14 @@ def analyze_stats_delivery_sources(sources: list[ParserSource]) -> tuple[bool, b
         )
     if sources_without_targets:
         unique_sources = list(dict.fromkeys(sources_without_targets))
+        enabled_labels: list[str] = []
+        if telegram_delivery_enabled:
+            enabled_labels.append("Telegram")
+        if vk_delivery_enabled:
+            enabled_labels.append("VK")
+        enabled_channels_label = "/".join(enabled_labels) or "Telegram/VK"
         raise RuntimeError(
-            "Для некоторых ссылок не указан ни Telegram, ни VK chat_id: "
+            f"Для некоторых ссылок не указан chat_id для включенных каналов ({enabled_channels_label}): "
             + " | ".join(unique_sources)
         )
 
@@ -9083,6 +9264,9 @@ def send_monthly_stats_test_route():
 
 
 def collect_unique_enabled_chat_ids() -> list[str]:
+    if not is_telegram_delivery_enabled():
+        return []
+
     with state.lock:
         raw_sources_with_chat = [
             ParserSource(
@@ -9113,6 +9297,9 @@ def collect_unique_enabled_chat_ids() -> list[str]:
 
 
 def collect_unique_enabled_vk_chat_ids() -> list[str]:
+    if not is_vk_delivery_enabled():
+        return []
+
     with state.lock:
         raw_sources = [
             ParserSource(
@@ -9150,6 +9337,9 @@ def send_test_message():
         state.info = ""
 
     try:
+        if not is_telegram_delivery_enabled() and not is_vk_delivery_enabled():
+            raise RuntimeError("Отправка в Telegram и VK отключена в настройках парсера")
+
         unique_tg_chat_ids = collect_unique_enabled_chat_ids()
         unique_vk_chat_ids = collect_unique_enabled_vk_chat_ids()
 
@@ -9288,6 +9478,9 @@ def send_settlement_test():
     updated_message = append_settlement_footer(base_message, footer_line)
 
     try:
+        if not is_telegram_delivery_enabled():
+            raise RuntimeError("Отправка в Telegram отключена в настройках парсера")
+
         tg_cfg = load_telegram_config()
         unique_chat_ids = collect_unique_enabled_chat_ids()
         if not unique_chat_ids:

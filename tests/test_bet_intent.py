@@ -56,3 +56,19 @@ def test_parse_moneyline_draw() -> None:
     intent = parse_bet_intent("Х")
     assert intent.market == "moneyline"
     assert intent.side == "draw"
+
+
+def test_parse_total_under_fourth_quarter() -> None:
+    intent = parse_bet_intent("4-я четверть ТМ (38)")
+    assert intent.period == "q4"
+    assert intent.market == "total"
+    assert intent.side == "under"
+    assert intent.line == 38.0
+
+
+def test_parse_total_under_third_time() -> None:
+    intent = parse_bet_intent("3 тайм ТМ (42.5)")
+    assert intent.period == "q3"
+    assert intent.market == "total"
+    assert intent.side == "under"
+    assert intent.line == 42.5

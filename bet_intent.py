@@ -11,7 +11,7 @@ _NUMBER_RE = r"[-+]?\d+(?:[\.,]\d+)?"
 @dataclass(frozen=True)
 class BetIntent:
     metric: str  # goals | corners | bookings
-    period: str  # ft | 1h | 2h
+    period: str  # ft | 1h | 2h | q3 | q4
     scope: str  # match | home | away
     market: str  # total | team_total | handicap | moneyline
     side: str  # over | under | home | away | draw | plus | minus
@@ -59,6 +59,16 @@ def _detect_metric(text: str) -> str:
 
 
 def _detect_period(text: str) -> str:
+    if re.search(
+        r"\b(?:3\s*(?:-?\s*(?:й|я))?\s*(?:тайм|четверт(?:ь|и)?)|(?:тайм|четверт(?:ь|и)?)\s*3|3rd\s+quarter|third\s+quarter|q\s*3|3q)\b",
+        text,
+    ):
+        return "q3"
+    if re.search(
+        r"\b(?:4\s*(?:-?\s*я)?\s*четверт(?:ь|и)?|четверт(?:ь|и)?\s*4|4th\s+quarter|fourth\s+quarter|q\s*4|4q)\b",
+        text,
+    ):
+        return "q4"
     if re.search(
         r"2\s*(?:-?\s*я)?\s*полов|втор[ао]я\s+полов|2nd\s+half|second\s+half|2\s*half",
         text,

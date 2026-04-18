@@ -76,9 +76,9 @@ class BlogabetPublishError(RuntimeError):
 
 class SELECTORS:
     SPORTS_CONTAINER = "#sports"
-    FOOTBALL_TRIGGER = "#sports [data-target='_SOC']"
-    FOOTBALL_LIST = "#_SOC"
-    LEAGUE_LINKS = "#_SOC .list-group-item a.odds"
+    SPORT_TRIGGER_TEMPLATE = "#sports [data-target='{sport_target}']"
+    SPORT_LIST_TEMPLATE = "#{sport_target}"
+    LEAGUE_LINKS_TEMPLATE = "#{sport_target} .list-group-item a.odds"
     LEAGUE_TITLE = ".leagueTitle"
     EVENT_CONTAINER = "#_event"
     EVENT_TAB_LINKS = "#_event ul.nav-tabs a[data-toggle='tab']"
@@ -142,8 +142,71 @@ _PERIOD_TAB_SYNONYMS: dict[str, tuple[str, ...]] = {
     "full_event": ("Full Event", "Full Time", "Match"),
     "first_half": ("First Half", "1st Half", "1H"),
     "second_half": ("Second Half", "2nd Half", "2H"),
+    "third_quarter": ("third quarter", "3rd quarter", "3 quarter", "q3"),
+    "fourth_quarter": ("fourth quarter", "4th quarter", "4 quarter", "q4"),
     "team_total": ("Team Total", "Team Totals"),
 }
+_SPORT_FOOTBALL = "football"
+_SPORT_BASKETBALL = "basketball"
+_SPORT_TARGETS: dict[str, str] = {
+    _SPORT_FOOTBALL: "_SOC",
+    _SPORT_BASKETBALL: "_BSK",
+}
+_SPORT_TITLES: dict[str, str] = {
+    _SPORT_FOOTBALL: "Football",
+    _SPORT_BASKETBALL: "Basketball",
+}
+_BASKETBALL_MARKERS = (
+    "баскет",
+    "basket",
+    "nba",
+    "wnba",
+    "euroleague",
+    "euroliga",
+    "евролига",
+    "nbl",
+    "overtime",
+    "овертайм",
+)
+
+
+def _sport_target(sport_key: str) -> str:
+    return _SPORT_TARGETS.get(sport_key, _SPORT_TARGETS[_SPORT_FOOTBALL])
+
+
+def _sport_title(sport_key: str) -> str:
+    return _SPORT_TITLES.get(sport_key, _SPORT_TITLES[_SPORT_FOOTBALL])
+
+
+def _league_links_selector_for_sport(sport_key: str) -> str:
+    return SELECTORS.LEAGUE_LINKS_TEMPLATE.format(sport_target=_sport_target(sport_key))
+
+
+def _detect_match_sport_key(match: Any, intent: BetIntent) -> str:
+    if intent.period in {"q3", "q4"}:
+        return _SPORT_BASKETBALL
+
+    text_parts = [
+        getattr(match, "tournament", ""),
+        getattr(match, "home_team", ""),
+        getattr(match, "away_team", ""),
+        getattr(match, "rate_description", ""),
+        getattr(match, "href", ""),
+        intent.raw_text,
+    ]
+    search_blob = normalize(" ".join(str(value or "") for value in text_parts))
+    if any(marker in search_blob for marker in _BASKETBALL_MARKERS):
+        return _SPORT_BASKETBALL
+
+    if (
+        intent.metric == "goals"
+        and intent.market in {"total", "team_total"}
+        and intent.line is not None
+        and float(intent.line) >= 80.0
+    ):
+        return _SPORT_BASKETBALL
+
+    return _SPORT_FOOTBALL
 
 
 async def _first_visible(locator: Any, *, limit: int = 8) -> Any:
@@ -317,6 +380,10 @@ def resolve_period_tab_request(intent: BetIntent) -> dict[str, Any]:
         key = "first_half"
     elif intent.period == "2h":
         key = "second_half"
+    elif intent.period == "q3":
+        key = "third_quarter"
+    elif intent.period == "q4":
+        key = "fourth_quarter"
 
     synonyms = _PERIOD_TAB_SYNONYMS[key]
     return {
@@ -453,11 +520,17 @@ async def _read_league_title(link: Any) -> str:
     return normalize(await link.inner_text())
 
 
-async def _collect_league_entries(page: AsyncPage) -> list[dict[str, Any]]:
-    league_links = page.locator(SELECTORS.LEAGUE_LINKS)
+async def _collect_league_entries(
+    page: AsyncPage,
+    *,
+    league_links_selector: Optional[str] = None,
+    sport_title: str = "Football",
+) -> list[dict[str, Any]]:
+    selector = league_links_selector or _league_links_selector_for_sport(_SPORT_FOOTBALL)
+    league_links = page.locator(selector)
     total = await league_links.count()
     if total == 0:
-        raise BlogabetPublishError("find_league", "Список лиг Football пуст")
+        raise BlogabetPublishError("find_league", f"Список лиг {sport_title} пуст")
 
     entries: list[dict[str, Any]] = []
     for index in range(total):
@@ -534,10 +607,13 @@ async def select_league_by_tournament(
     tournament: str,
     metric: str,
     *,
+    league_links_selector: Optional[str] = None,
+    sport_title: str = "Football",
     league_aliases: Optional[dict[str, str]] = None,
     fallback_top_n: int = _DEFAULT_LEAGUE_FALLBACK_CANDIDATES,
 ) -> dict[str, Any]:
-    entries = await _collect_league_entries(page)
+    selector = league_links_selector or _league_links_selector_for_sport(_SPORT_FOOTBALL)
+    entries = await _collect_league_entries(page, league_links_selector=selector, sport_title=sport_title)
     plan = build_league_selection_plan(
         entries,
         tournament,
@@ -546,7 +622,7 @@ async def select_league_by_tournament(
         fallback_top_n=fallback_top_n,
     )
 
-    league_links = page.locator(SELECTORS.LEAGUE_LINKS)
+    league_links = page.locator(selector)
     best = plan["best"]
     best_link = league_links.nth(int(best["index"]))
     await best_link.scroll_into_view_if_needed()
@@ -1026,19 +1102,24 @@ class BlogabetPublisher:
             except Exception:  # noqa: BLE001
                 continue
 
-    async def _select_football(self, page: AsyncPage) -> None:
-        football_trigger = page.locator(SELECTORS.FOOTBALL_TRIGGER)
-        if await football_trigger.count() == 0:
-            raise BlogabetPublishError("select_sport", "Не найден триггер Football")
-        await football_trigger.first.click()
+    async def _select_sport(self, page: AsyncPage, *, sport_target: str, sport_title: str) -> None:
+        sport_trigger_selector = SELECTORS.SPORT_TRIGGER_TEMPLATE.format(sport_target=sport_target)
+        sport_trigger = page.locator(sport_trigger_selector)
+        if await sport_trigger.count() == 0:
+            raise BlogabetPublishError("select_sport", f"Не найден триггер {sport_title}")
+        await sport_trigger.first.click()
         await page.wait_for_timeout(400)
+        sport_list_selector = SELECTORS.SPORT_LIST_TEMPLATE.format(sport_target=sport_target)
+        await page.wait_for_selector(sport_list_selector, state="attached", timeout=10000)
 
     async def _resolve_league_link_for_candidate(
         self,
         page: AsyncPage,
         candidate: dict[str, Any],
+        *,
+        league_links_selector: str,
     ) -> Any:
-        league_links = page.locator(SELECTORS.LEAGUE_LINKS)
+        league_links = page.locator(league_links_selector)
         total = await league_links.count()
         if total == 0:
             return None
@@ -1073,12 +1154,23 @@ class BlogabetPublisher:
         self,
         page: AsyncPage,
         candidate: dict[str, Any],
+        *,
+        league_links_selector: str,
+        sport_title: str,
     ) -> None:
-        league_link = await self._resolve_league_link_for_candidate(page, candidate)
+        league_link = await self._resolve_league_link_for_candidate(
+            page,
+            candidate,
+            league_links_selector=league_links_selector,
+        )
         if league_link is None:
             available: list[str] = []
             try:
-                entries = await _collect_league_entries(page)
+                entries = await _collect_league_entries(
+                    page,
+                    league_links_selector=league_links_selector,
+                    sport_title=sport_title,
+                )
                 available = [str(entry.get("title", "")) for entry in entries[:20]]
             except Exception:  # noqa: BLE001
                 available = []
@@ -1114,9 +1206,17 @@ class BlogabetPublisher:
         self,
         page: AsyncPage,
         candidate: dict[str, Any],
+        *,
+        league_links_selector: str,
+        sport_title: str,
     ) -> bool:
         try:
-            await self._click_league_candidate(page, candidate)
+            await self._click_league_candidate(
+                page,
+                candidate,
+                league_links_selector=league_links_selector,
+                sport_title=sport_title,
+            )
             await self._wait_for_events_after_league_selection(page)
             return True
         except BlogabetPublishError:
@@ -1128,6 +1228,8 @@ class BlogabetPublisher:
         intent: BetIntent,
         *,
         selected_league_candidate: Optional[dict[str, Any]] = None,
+        league_links_selector: str,
+        sport_title: str,
     ) -> dict[str, Any]:
         tab_request = resolve_period_tab_request(intent)
         tab_target_text = str(tab_request["primary"])
@@ -1151,7 +1253,12 @@ class BlogabetPublisher:
                 attempt_diag["tabs_wait"] = "timeout"
                 attempt_diag["wait_error"] = normalize(str(exc))[:220]
                 if not reclick_done and selected_league_candidate is not None:
-                    reclick_done = await self._reclick_league_candidate(page, selected_league_candidate)
+                    reclick_done = await self._reclick_league_candidate(
+                        page,
+                        selected_league_candidate,
+                        league_links_selector=league_links_selector,
+                        sport_title=sport_title,
+                    )
                     attempt_diag["league_reclick"] = reclick_done
                 diagnostics["attempts"].append(attempt_diag)
                 await page.wait_for_timeout(600 + attempt_no * 250)
@@ -1182,7 +1289,12 @@ class BlogabetPublisher:
             attempt_diag["result"] = "tab_not_found"
             attempt_diag["available_tabs"] = tab_titles[:15]
             if not reclick_done and selected_league_candidate is not None:
-                reclick_done = await self._reclick_league_candidate(page, selected_league_candidate)
+                reclick_done = await self._reclick_league_candidate(
+                    page,
+                    selected_league_candidate,
+                    league_links_selector=league_links_selector,
+                    sport_title=sport_title,
+                )
                 attempt_diag["league_reclick"] = reclick_done
             diagnostics["attempts"].append(attempt_diag)
             await page.wait_for_timeout(600 + attempt_no * 250)
@@ -1208,8 +1320,15 @@ class BlogabetPublisher:
         match: Any,
         bet_intent: BetIntent,
         diagnostics: dict[str, Any],
+        *,
+        league_links_selector: str,
+        sport_title: str,
     ) -> tuple[int, dict[str, Any], dict[str, Any]]:
-        entries = await _collect_league_entries(page)
+        entries = await _collect_league_entries(
+            page,
+            league_links_selector=league_links_selector,
+            sport_title=sport_title,
+        )
         league_plan = build_league_selection_plan(
             entries,
             match.tournament,
@@ -1240,12 +1359,19 @@ class BlogabetPublisher:
                 "fail_reason": "",
             }
             try:
-                await self._click_league_candidate(page, candidate)
+                await self._click_league_candidate(
+                    page,
+                    candidate,
+                    league_links_selector=league_links_selector,
+                    sport_title=sport_title,
+                )
                 await self._wait_for_events_after_league_selection(page)
                 tab_diag = await self._switch_period_tab(
                     page,
                     bet_intent,
                     selected_league_candidate=candidate,
+                    league_links_selector=league_links_selector,
+                    sport_title=sport_title,
                 )
                 attempt_diag["period_tab"] = tab_diag
                 best_block_index, match_result = await self._find_event_block(
@@ -2168,8 +2294,18 @@ class BlogabetPublisher:
                     )
                 await self._dismiss_age_confirmation(page)
 
+                sport_key = _detect_match_sport_key(match, bet_intent)
+                sport_target = _sport_target(sport_key)
+                sport_title = _sport_title(sport_key)
+                league_links_selector = _league_links_selector_for_sport(sport_key)
+                diagnostics["sport"] = {
+                    "key": sport_key,
+                    "target": sport_target,
+                    "title": sport_title,
+                }
+
                 step_name = "select_sport"
-                await self._select_football(page)
+                await self._select_sport(page, sport_target=sport_target, sport_title=sport_title)
 
                 step_name = "find_league"
                 best_block_index, match_result, selected_league = await self._find_match_with_league_fallback(
@@ -2177,6 +2313,8 @@ class BlogabetPublisher:
                     match,
                     bet_intent,
                     diagnostics,
+                    league_links_selector=league_links_selector,
+                    sport_title=sport_title,
                 )
                 diagnostics["selected_league"] = selected_league
                 diagnostics["match_candidates"] = match_result.get("top_candidates", [])

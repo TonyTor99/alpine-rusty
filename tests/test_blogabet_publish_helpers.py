@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 from bet_intent import BetIntent
 from blogabet_publisher import (
+    _detect_match_sport_key,
     _clean_team_label,
     build_league_selection_plan,
     is_recoverable_submit_error,
@@ -76,7 +79,53 @@ def test_period_tab_synonyms_resolution() -> None:
     assert "1st Half" in first_half_request["synonyms"]
     assert tab_text_matches_synonyms("1H", first_half_request["synonyms"]) is True
 
+    third_quarter_request = resolve_period_tab_request(_intent(market="total", period="q3"))
+    assert third_quarter_request["primary"] == "third quarter"
+    assert "3rd quarter" in third_quarter_request["synonyms"]
+    assert tab_text_matches_synonyms("Q3", third_quarter_request["synonyms"]) is True
+
+    fourth_quarter_request = resolve_period_tab_request(_intent(market="total", period="q4"))
+    assert fourth_quarter_request["primary"] == "fourth quarter"
+    assert "4th quarter" in fourth_quarter_request["synonyms"]
+    assert tab_text_matches_synonyms("Q4", fourth_quarter_request["synonyms"]) is True
+
     team_total_request = resolve_period_tab_request(_intent(market="team_total", period="ft"))
     assert team_total_request["primary"] == "Team Total"
     assert "Team Totals" in team_total_request["synonyms"]
     assert tab_text_matches_synonyms("Team Totals", team_total_request["synonyms"]) is True
+
+
+def test_detect_match_sport_key_from_q4_period() -> None:
+    intent = _intent(market="total", period="q4")
+    match = SimpleNamespace(
+        tournament="Friendly League",
+        home_team="Home",
+        away_team="Away",
+        rate_description="",
+        href="",
+    )
+    assert _detect_match_sport_key(match, intent) == "basketball"
+
+
+def test_detect_match_sport_key_from_q3_period() -> None:
+    intent = _intent(market="total", period="q3")
+    match = SimpleNamespace(
+        tournament="Friendly League",
+        home_team="Home",
+        away_team="Away",
+        rate_description="",
+        href="",
+    )
+    assert _detect_match_sport_key(match, intent) == "basketball"
+
+
+def test_detect_match_sport_key_from_markers() -> None:
+    intent = _intent(market="total", period="ft")
+    match = SimpleNamespace(
+        tournament="NBA",
+        home_team="Home",
+        away_team="Away",
+        rate_description="",
+        href="",
+    )
+    assert _detect_match_sport_key(match, intent) == "basketball"
