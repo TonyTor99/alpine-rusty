@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-04-06",
+  "updated_at": "2026-04-10",
   "aliases": {
     "Austria - Bundesliga Corners": "Austrian Cor",
     "Thailand - League 1 Corners": "Thailand - Premier League Corners",
@@ -8,6 +8,23 @@
     "Spain - Segunda Division Corners": "Segunda Cor",
     "France - Ligue 1 Corners": "France Pro League",
     "Italy - Serie B Corners": "Serie B Cor",
-    "Brazil - Serie A Corners": "BrazilSerACR"
+    "Brazil - Serie A Corners": "BrazilSerACR",
+    "UEFA - Champions League Corners": "CLcorners",
+    "CONMEBOL - Copa Libertadores Corners": "Copa Liber.",
+
+    "Greece - Super League 2": "Greece - Super League 2",
+    "Argentina - Primera B Nacional Corners": "Argentina - Primera B Nacional Corners",
+    "England - League 2 Corners": "England - League 2 Corners",
+    "Finland - Ykkonen Corners": "Finland - Ykkonen Corners",
+    "Italy - Serie C Group A": "Italy - Serie C Group A",
+    "Italy - Serie C Group A Corners": "Italy - Serie C Group A Corners",
+    "Poland - Ekstraklasa Corners": "Pol O E Cor",
+    "Scotland - Premiership Corners": "Scotland - Premier League Corners",
+    "Germany - Bundesliga Corners": "Bund Corners",
+    "Spain - La Liga Corners": "La Liga Corn",
+    "Turkey - 1st League Corners": "Turkey - 1st League Corners",
+    "Portugal - U23 Championship": "Portugal - U23 Championship",
+    "Israel - Premier League": "Israel Prem",
+    "Uruguay - Primera Division Corners": "Uruguay - Primera Division Corners"
   }
 }

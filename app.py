@@ -170,6 +170,7 @@ MAX_PENDING_SETTLEMENT_CANDIDATES = 500
 DEFAULT_BLOGABET_STORAGE_STATE_PATH = "./blogabet_state.json"
 DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH = "./blogabet_league_aliases.json"
 DEFAULT_BLOGABET_STAKE = 3
+BLOGABET_LEAGUE_ALIASES_FORMAT_VERSION = 1
 
 
 @dataclass
@@ -308,6 +309,7 @@ class ParserSource:
     chat_id: str = ""
     vk_chat_ids: tuple[str, ...] = ()
     enabled: bool = True
+    blogabet_enabled: bool = True
 
 
 @dataclass
@@ -595,6 +597,93 @@ def upsert_env_value(key: str, value: str, env_path: Optional[Path] = None) -> N
         )
 
 
+def resolve_blogabet_league_aliases_path() -> Path:
+    load_dotenv()
+    return Path(
+        resolve_local_path(
+            os.getenv("BLOGABET_LEAGUE_ALIASES_PATH", DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH),
+            DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH,
+        )
+    )
+
+
+def _parse_aliases_format_version(raw_value: Any) -> int:
+    if isinstance(raw_value, int) and raw_value > 0:
+        return raw_value
+
+    if isinstance(raw_value, str):
+        normalized = normalize_text(raw_value)
+        if normalized.isdigit():
+            parsed = int(normalized)
+            if parsed > 0:
+                return parsed
+
+    return BLOGABET_LEAGUE_ALIASES_FORMAT_VERSION
+
+
+def _normalize_blogabet_league_aliases(raw_aliases: Any) -> dict[str, str]:
+    if raw_aliases is None:
+        return {}
+    if not isinstance(raw_aliases, dict):
+        raise ValueError("Ключ aliases должен быть объектом")
+
+    aliases: dict[str, str] = {}
+    for source, target in raw_aliases.items():
+        source_text = normalize_text(str(source))
+        target_text = normalize_text(str(target))
+        if not source_text or not target_text:
+            continue
+        aliases[source_text] = target_text
+    return aliases
+
+
+def load_blogabet_league_aliases_payload(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "version": BLOGABET_LEAGUE_ALIASES_FORMAT_VERSION,
+            "updated_at": "",
+            "aliases": {},
+        }
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Не удалось прочитать JSON алиасов: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Файл алиасов должен содержать JSON-объект")
+
+    aliases = _normalize_blogabet_league_aliases(payload.get("aliases"))
+    version = _parse_aliases_format_version(payload.get("version"))
+    updated_at = normalize_text(str(payload.get("updated_at", "")))
+
+    return {
+        "version": version,
+        "updated_at": updated_at,
+        "aliases": aliases,
+    }
+
+
+def save_blogabet_league_aliases_payload(path: Path, payload: dict[str, Any]) -> None:
+    aliases = _normalize_blogabet_league_aliases(payload.get("aliases"))
+    version = _parse_aliases_format_version(payload.get("version"))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": version,
+                "updated_at": date.today().isoformat(),
+                "aliases": aliases,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def remove_query_param(url: str, key: str) -> str:
     normalized_url = normalize_text(url)
     if not normalized_url:
@@ -832,7 +921,7 @@ def iter_source_match_delivery_targets(
     include_blogabet: bool,
 ) -> list[tuple[str, str]]:
     targets = iter_source_delivery_targets(source)
-    if include_blogabet:
+    if include_blogabet and source.blogabet_enabled:
         targets.append(("blogabet", "default"))
     return targets
 
@@ -1942,6 +2031,7 @@ def clone_parser_sources(sources: list[ParserSource]) -> list[ParserSource]:
             chat_id=source.chat_id,
             vk_chat_ids=tuple(source.vk_chat_ids),
             enabled=source.enabled,
+            blogabet_enabled=source.blogabet_enabled,
         )
         for source in sources
     ]
@@ -1957,6 +2047,7 @@ def write_parser_sources_to_storage(sources: list[ParserSource]) -> None:
             "vk_chat_ids": list(source.vk_chat_ids),
             "vk_chat_id": source.vk_chat_ids[0] if source.vk_chat_ids else "",
             "enabled": source.enabled,
+            "blogabet_enabled": source.blogabet_enabled,
         }
         for source in sources
     ]
@@ -2019,6 +2110,14 @@ def load_parser_sources_from_storage() -> list[ParserSource]:
             continue
 
         source_enabled = bool(item.get("enabled", True))
+        raw_blogabet_enabled = item.get("blogabet_enabled", True)
+        if isinstance(raw_blogabet_enabled, bool):
+            source_blogabet_enabled = raw_blogabet_enabled
+        else:
+            source_blogabet_enabled = parse_bool_env(
+                str(raw_blogabet_enabled),
+                default=True,
+            )
         source_id = str(len(loaded_sources) + 1)
         loaded_sources.append(
             ParserSource(
@@ -2027,6 +2126,7 @@ def load_parser_sources_from_storage() -> list[ParserSource]:
                 chat_id=chat_id_raw,
                 vk_chat_ids=vk_chat_ids,
                 enabled=source_enabled,
+                blogabet_enabled=source_blogabet_enabled,
             )
         )
         seen_urls.add(source_url)
@@ -2073,6 +2173,7 @@ def add_parser_source(url: str, chat_id: str, vk_chat_ids_raw: str = "") -> tupl
                     chat_id=source.chat_id,
                     vk_chat_ids=source.vk_chat_ids,
                     enabled=source.enabled,
+                    blogabet_enabled=source.blogabet_enabled,
                 )
                 break
         else:
@@ -2083,6 +2184,7 @@ def add_parser_source(url: str, chat_id: str, vk_chat_ids_raw: str = "") -> tupl
                 chat_id=normalized_chat_id,
                 vk_chat_ids=vk_chat_ids,
                 enabled=True,
+                blogabet_enabled=True,
             )
             state.parser_sources.append(source)
             snapshot = clone_parser_sources(state.parser_sources)
@@ -2106,6 +2208,30 @@ def toggle_parser_source(source_id: str) -> ParserSource:
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                blogabet_enabled=source.blogabet_enabled,
+            )
+            break
+        else:
+            raise ValueError("Ссылка не найдена")
+
+    persist_parser_sources_snapshot(snapshot)
+    return toggled
+
+
+def toggle_parser_source_blogabet(source_id: str) -> ParserSource:
+    with state.lock:
+        for source in state.parser_sources:
+            if source.source_id != source_id:
+                continue
+            source.blogabet_enabled = not source.blogabet_enabled
+            snapshot = clone_parser_sources(state.parser_sources)
+            toggled = ParserSource(
+                source_id=source.source_id,
+                url=source.url,
+                chat_id=source.chat_id,
+                vk_chat_ids=source.vk_chat_ids,
+                enabled=source.enabled,
+                blogabet_enabled=source.blogabet_enabled,
             )
             break
         else:
@@ -2145,6 +2271,7 @@ def update_parser_source_chat_id(source_id: str, chat_id: str) -> ParserSource:
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                blogabet_enabled=source.blogabet_enabled,
             )
             break
         else:
@@ -2169,6 +2296,7 @@ def update_parser_source_vk_chat_ids(source_id: str, vk_chat_ids_raw: str) -> Pa
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                blogabet_enabled=source.blogabet_enabled,
             )
             break
         else:
@@ -6404,6 +6532,7 @@ async def parser_worker_async(
                                     chat_id=source.chat_id,
                                     vk_chat_ids=tuple(source.vk_chat_ids),
                                     enabled=True,
+                                    blogabet_enabled=source.blogabet_enabled,
                                 )
                                 for source in state.parser_sources
                                 if source.enabled
@@ -7599,14 +7728,25 @@ TEMPLATE = """
               <button class="secondary mini" type="submit" {% if not can_manage_parser %}disabled{% endif %}>Сохранить VK chat_id</button>
             </form>
             <div class="source-controls">
-              <span class="source-state {% if not source.enabled %}off{% endif %}">
-                {% if source.enabled %}Включена{% else %}Выключена{% endif %}
-              </span>
+              <div class="chip-row">
+                <span class="source-state {% if not source.enabled %}off{% endif %}">
+                  {% if source.enabled %}Ссылка: Включена{% else %}Ссылка: Выключена{% endif %}
+                </span>
+                <span class="source-state {% if not source.blogabet_enabled %}off{% endif %}">
+                  {% if source.blogabet_enabled %}Blogabet: Включен{% else %}Blogabet: Выключен{% endif %}
+                </span>
+              </div>
               <div class="source-actions">
                 <form method="post" action="{{ url_for('toggle_parser_source_route') }}">
                   <input type="hidden" name="source_id" value="{{ source.source_id }}" />
                   <button class="secondary mini" type="submit" {% if not can_manage_parser %}disabled{% endif %}>
                     {% if source.enabled %}Выключить{% else %}Включить{% endif %}
+                  </button>
+                </form>
+                <form method="post" action="{{ url_for('toggle_parser_source_blogabet_route') }}">
+                  <input type="hidden" name="source_id" value="{{ source.source_id }}" />
+                  <button class="secondary mini" type="submit" {% if not can_manage_parser %}disabled{% endif %}>
+                    {% if source.blogabet_enabled %}Blogabet OFF{% else %}Blogabet ON{% endif %}
                   </button>
                 </form>
                 <form method="post" action="{{ url_for('delete_parser_source_route') }}">
@@ -7692,6 +7832,47 @@ TEMPLATE = """
             </form>
             <div class="hint">Если при входе есть CAPTCHA/reCAPTCHA, пройди её вручную в открытом браузере.</div>
             <div class="hint">Автологин использует BLOGABET_LOGIN_EMAIL и BLOGABET_LOGIN_PASSWORD (если заданы).</div>
+          </article>
+
+          <article class="tile full">
+            <h3>League aliases</h3>
+            <form method="post" action="{{ url_for('blogabet_alias_upsert_route') }}">
+              <input
+                name="alias_source_tournament"
+                type="text"
+                placeholder="Tournament из парсера, например: Austria - Bundesliga Corners"
+                required
+              />
+              <input
+                name="alias_target_league"
+                type="text"
+                placeholder="Название лиги в Blogabet, например: Austrian Cor"
+                required
+              />
+              <div class="source-actions">
+                <button class="secondary mini" type="submit">Сохранить алиас</button>
+              </div>
+            </form>
+            <div class="hint">Файл алиасов: <code>{{ blogabet_league_aliases_path }}</code></div>
+            <div class="hint">Файл: {{ 'найден' if blogabet_league_aliases_exists else 'будет создан при первом сохранении' }}</div>
+            <div class="hint">
+              Записей: {{ blogabet_league_aliases_count }}
+              {% if blogabet_league_aliases_updated_at %} · updated_at: {{ blogabet_league_aliases_updated_at }}{% endif %}
+            </div>
+            {% if blogabet_league_aliases %}
+            <div class="source-list">
+              {% for alias in blogabet_league_aliases %}
+              <div class="source-row">
+                <div class="source-url">{{ alias.source }}</div>
+                <div class="chip-row">
+                  <span class="chip">→ {{ alias.target }}</span>
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <div class="hint">Алиасы пока не добавлены.</div>
+            {% endif %}
           </article>
 
           <article class="tile full">
@@ -7888,6 +8069,11 @@ def index():
         DEFAULT_BLOGABET_STORAGE_STATE_PATH,
     )
     blogabet_storage_state_exists = Path(blogabet_storage_state_path).exists()
+    blogabet_league_aliases_path = str(resolve_blogabet_league_aliases_path())
+    blogabet_league_aliases_exists = Path(blogabet_league_aliases_path).exists()
+    blogabet_league_aliases_updated_at = ""
+    blogabet_league_aliases: list[dict[str, str]] = []
+    blogabet_league_aliases_count = 0
     default_interval = DEFAULT_PARSER_INTERVAL_SECONDS
     default_parser_page_max_age_seconds = DEFAULT_PARSER_PAGE_MAX_AGE_SECONDS
     default_parser_send_existing_on_start = True
@@ -7921,11 +8107,36 @@ def index():
         blogabet_default_stake = blogabet_cfg.default_stake
         blogabet_storage_state_path = blogabet_cfg.storage_state_path
         blogabet_storage_state_exists = Path(blogabet_storage_state_path).exists()
+        blogabet_league_aliases_path = blogabet_cfg.league_aliases_path
+        blogabet_league_aliases_exists = Path(blogabet_league_aliases_path).exists()
     except Exception as exc:  # noqa: BLE001
         if config_error:
             config_error = f"{config_error} | Blogabet: {exc}"
         else:
             config_error = f"Blogabet: {exc}"
+
+    try:
+        aliases_payload = load_blogabet_league_aliases_payload(Path(blogabet_league_aliases_path))
+        aliases_map = aliases_payload.get("aliases", {})
+        if not isinstance(aliases_map, dict):
+            aliases_map = {}
+        blogabet_league_aliases_updated_at = normalize_text(
+            str(aliases_payload.get("updated_at", ""))
+        )
+        blogabet_league_aliases = [
+            {
+                "source": source,
+                "target": target,
+            }
+            for source, target in aliases_map.items()
+        ]
+        blogabet_league_aliases.sort(key=lambda item: normalize_text(item["source"]).lower())
+        blogabet_league_aliases_count = len(blogabet_league_aliases)
+    except Exception as exc:  # noqa: BLE001
+        if config_error:
+            config_error = f"{config_error} | Aliases: {humanize_parser_error(exc)}"
+        else:
+            config_error = f"Aliases: {humanize_parser_error(exc)}"
 
     try:
         counters = get_match_store().fetch_status_counters()
@@ -8018,6 +8229,11 @@ def index():
             blogabet_default_stake=blogabet_default_stake,
             blogabet_storage_state_path=blogabet_storage_state_path,
             blogabet_storage_state_exists=blogabet_storage_state_exists,
+            blogabet_league_aliases_path=blogabet_league_aliases_path,
+            blogabet_league_aliases_exists=blogabet_league_aliases_exists,
+            blogabet_league_aliases_updated_at=blogabet_league_aliases_updated_at,
+            blogabet_league_aliases=blogabet_league_aliases,
+            blogabet_league_aliases_count=blogabet_league_aliases_count,
             blogabet_test_log=blogabet_test_log,
             blogabet_test_pick_url=blogabet_test_pick_url,
             blogabet_test_screenshot_path=blogabet_test_screenshot_path,
@@ -8390,6 +8606,36 @@ def toggle_parser_source_route():
     return redirect(url_for("index"))
 
 
+@app.post("/toggle-parser-source-blogabet")
+def toggle_parser_source_blogabet_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    source_id = request.form.get("source_id", "").strip()
+    if not source_id:
+        with state.lock:
+            state.error = "Не передан идентификатор ссылки"
+        return redirect(url_for("index"))
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+
+        source = toggle_parser_source_blogabet(source_id)
+        status_label = "включен" if source.blogabet_enabled else "выключен"
+        with state.lock:
+            state.info = f"Постинг в Blogabet {status_label}: {source.url}"
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось изменить статус Blogabet для ссылки: {exc}"
+
+    return redirect(url_for("index"))
+
+
 @app.post("/delete-parser-source")
 def delete_parser_source_route():
     with state.lock:
@@ -8629,6 +8875,7 @@ def send_daily_stats_test_route():
                     chat_id=source.chat_id,
                     vk_chat_ids=tuple(source.vk_chat_ids),
                     enabled=True,
+                    blogabet_enabled=source.blogabet_enabled,
                 )
                 for source in state.parser_sources
                 if source.enabled
@@ -8705,6 +8952,7 @@ def send_weekly_stats_test_route():
                     chat_id=source.chat_id,
                     vk_chat_ids=tuple(source.vk_chat_ids),
                     enabled=True,
+                    blogabet_enabled=source.blogabet_enabled,
                 )
                 for source in state.parser_sources
                 if source.enabled
@@ -8783,6 +9031,7 @@ def send_monthly_stats_test_route():
                     chat_id=source.chat_id,
                     vk_chat_ids=tuple(source.vk_chat_ids),
                     enabled=True,
+                    blogabet_enabled=source.blogabet_enabled,
                 )
                 for source in state.parser_sources
                 if source.enabled
@@ -8842,6 +9091,7 @@ def collect_unique_enabled_chat_ids() -> list[str]:
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                blogabet_enabled=source.blogabet_enabled,
             )
             for source in state.parser_sources
             if source.enabled and normalize_chat_id(source.chat_id)
@@ -8871,6 +9121,7 @@ def collect_unique_enabled_vk_chat_ids() -> list[str]:
                 chat_id=source.chat_id,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
+                blogabet_enabled=source.blogabet_enabled,
             )
             for source in state.parser_sources
             if source.enabled and source.vk_chat_ids
@@ -9120,6 +9371,48 @@ def blogabet_login_route():
         log_blogabet_exception("Blogabet login не выполнен: %s", humanize_parser_error(exc))
         with state.lock:
             state.error = f"Blogabet login не выполнен: {humanize_parser_error(exc)}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/blogabet-alias-upsert")
+def blogabet_alias_upsert_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    source_tournament = normalize_text(request.form.get("alias_source_tournament", ""))
+    target_league = normalize_text(request.form.get("alias_target_league", ""))
+
+    if not source_tournament or not target_league:
+        with state.lock:
+            state.error = "Нужно заполнить Tournament и Blogabet league для алиаса"
+        return redirect(url_for("index"))
+
+    try:
+        aliases_path = resolve_blogabet_league_aliases_path()
+        payload = load_blogabet_league_aliases_payload(aliases_path)
+        aliases = payload.get("aliases", {})
+        if not isinstance(aliases, dict):
+            aliases = {}
+
+        is_update = source_tournament in aliases
+        aliases[source_tournament] = target_league
+        payload["aliases"] = aliases
+        save_blogabet_league_aliases_payload(aliases_path, payload)
+
+        with state.lock:
+            state.info = (
+                f"Алиас обновлен: {source_tournament} -> {target_league}"
+                if is_update
+                else f"Алиас добавлен: {source_tournament} -> {target_league}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = (
+                "Не удалось сохранить алиас лиги Blogabet: "
+                f"{humanize_parser_error(exc)}"
+            )
 
     return redirect(url_for("index"))
 
