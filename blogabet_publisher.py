@@ -149,12 +149,15 @@ _PERIOD_TAB_SYNONYMS: dict[str, tuple[str, ...]] = {
 }
 _SPORT_FOOTBALL = "football"
 _SPORT_BASKETBALL = "basketball"
+_SPORT_TENNIS = "tennis"
 _SPORT_TARGETS: dict[str, str] = {
     _SPORT_FOOTBALL: "_SOC",
+    _SPORT_TENNIS: "_TNS",
     _SPORT_BASKETBALL: "_BSK",
 }
 _SPORT_TITLES: dict[str, str] = {
     _SPORT_FOOTBALL: "Football",
+    _SPORT_TENNIS: "Tennis",
     _SPORT_BASKETBALL: "Basketball",
 }
 _BASKETBALL_MARKERS = (
@@ -168,6 +171,25 @@ _BASKETBALL_MARKERS = (
     "nbl",
     "overtime",
     "овертайм",
+)
+_TENNIS_MARKERS = (
+    "теннис",
+    "tennis",
+    "wta",
+    "atp",
+    "itf",
+    "challenger",
+    "челленджер",
+    "davis cup",
+    "billie jean king",
+    "wimbledon",
+    "roland garros",
+    "australian open",
+    "us open",
+    "гейм",
+    "геймы",
+    "геймов",
+    "games",
 )
 
 
@@ -198,6 +220,9 @@ def _detect_match_sport_key(match: Any, intent: BetIntent) -> str:
     search_blob = normalize(" ".join(str(value or "") for value in text_parts))
     if any(marker in search_blob for marker in _BASKETBALL_MARKERS):
         return _SPORT_BASKETBALL
+
+    if any(marker in search_blob for marker in _TENNIS_MARKERS):
+        return _SPORT_TENNIS
 
     if (
         intent.metric == "goals"

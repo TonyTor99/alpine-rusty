@@ -2790,6 +2790,26 @@ def detect_match_sport(match: ParsedMatch) -> tuple[str, str]:
     if any(marker in search_blob for marker in basketball_markers):
         return "🏀", "Баскетбол"
 
+    tennis_markers = (
+        "теннис",
+        "tennis",
+        "wta",
+        "atp",
+        "itf",
+        "challenger",
+        "челленджер",
+        "wimbledon",
+        "roland garros",
+        "australian open",
+        "us open",
+        "гейм",
+        "геймы",
+        "геймов",
+        "games",
+    )
+    if any(marker in search_blob for marker in tennis_markers):
+        return "🎾", "Теннис"
+
     return "⚽️", "Футбол"
 
 

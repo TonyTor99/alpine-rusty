@@ -157,6 +157,83 @@ def test_detect_match_sport_key_from_markers() -> None:
     assert _detect_match_sport_key(match, intent) == "basketball"
 
 
+def test_detect_match_sport_key_for_tennis_from_tournament_marker() -> None:
+    intent = _intent(market="total", period="ft")
+    match = SimpleNamespace(
+        tournament="WTA 125K Oeiras - Qualifiers",
+        home_team="Home",
+        away_team="Away",
+        rate_description="",
+        href="",
+    )
+    assert _detect_match_sport_key(match, intent) == "tennis"
+
+
+def test_detect_match_sport_key_for_tennis_from_signal_text_marker() -> None:
+    intent = BetIntent(
+        metric="goals",
+        period="ft",
+        scope="match",
+        market="total",
+        side="under",
+        line=13.5,
+        is_live=False,
+        current_score=None,
+        raw_text="Основная игра (геймы) ТМ (13.5)",
+    )
+    match = SimpleNamespace(
+        tournament="Friendly League",
+        home_team="Home",
+        away_team="Away",
+        rate_description="",
+        href="",
+    )
+    assert _detect_match_sport_key(match, intent) == "tennis"
+
+
+def test_detect_match_sport_key_for_tennis_handicap_signal() -> None:
+    intent = BetIntent(
+        metric="goals",
+        period="ft",
+        scope="home",
+        market="handicap",
+        side="minus",
+        line=-4.5,
+        is_live=False,
+        current_score=None,
+        raw_text="Фора1(-4.5)",
+    )
+    match = SimpleNamespace(
+        tournament="ATP Challenger Turin",
+        home_team="Home",
+        away_team="Away",
+        rate_description="",
+        href="",
+    )
+    assert _detect_match_sport_key(match, intent) == "tennis"
+
+
+def test_coupon_matches_intent_for_handicap_home_line() -> None:
+    intent = BetIntent(
+        metric="goals",
+        period="ft",
+        scope="home",
+        market="handicap",
+        side="minus",
+        line=-4.5,
+        is_live=False,
+        current_score=None,
+        raw_text="Фора1(-4.5)",
+    )
+    ok, diag = _coupon_matches_intent(
+        "Full Event Home -4.50 @ 1.850",
+        intent,
+    )
+    assert ok is True
+    assert diag["intent_scope_ok"] is True
+    assert diag["intent_line_ok"] is True
+
+
 def test_coupon_moneyline_rejects_handicap_coupon_text() -> None:
     ok, diag = _coupon_matches_intent(
         "Full Event Home +0.75 (AH) (1 - 0) @ 1.568",
