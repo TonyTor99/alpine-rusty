@@ -1256,6 +1256,67 @@ class BlogabetPublisher:
             except Exception:  # noqa: BLE001
                 continue
 
+    async def _ensure_authenticated_or_relogin(self, page: AsyncPage) -> None:
+        """Проверяет, что сессия Blogabet жива; при потере — авто-релогин по email/паролю.
+
+        Контейнер видов спорта (#sports) доступен только залогиненному пользователю,
+        поэтому используем его как признак валидной сессии. Если сессия протухла,
+        логинимся заново прямо в текущем контексте и сохраняем свежий storage state,
+        чтобы публикация не падала месяцами из-за истёкших cookie.
+        """
+        try:
+            if await page.locator(SELECTORS.SPORTS_CONTAINER).count() > 0:
+                return
+        except Exception:  # noqa: BLE001
+            pass
+
+        email = (self.cfg.login_email or "").strip()
+        password = self.cfg.login_password or ""
+        if not email or not password:
+            raise BlogabetAuthRequired(
+                "Сессия Blogabet недействительна, а BLOGABET_LOGIN_EMAIL/"
+                "BLOGABET_LOGIN_PASSWORD не заданы для автологина."
+            )
+
+        self._log("warning", "Сессия Blogabet недействительна — выполняю авто-релогин.")
+        await self._open_login_popup(page)
+        if not await self._try_auto_login(page):
+            raise BlogabetAuthRequired(
+                "Авто-релогин Blogabet не удался: форма логина не заполнена."
+            )
+
+        deadline = time.monotonic() + 45
+        authenticated = False
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(1500)
+            try:
+                await page.goto(self.cfg.upcoming_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(800)
+            except Exception:  # noqa: BLE001
+                continue
+            if "login" in normalize(page.url).lower():
+                continue
+            try:
+                if await page.locator(SELECTORS.SPORTS_CONTAINER).count() > 0:
+                    authenticated = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        if not authenticated:
+            raise BlogabetAuthRequired("Авто-релогин Blogabet не подтверждён.")
+
+        try:
+            storage_state_path = self._storage_state_path()
+            storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._context is not None:
+                await self._context.storage_state(path=str(storage_state_path))
+            self._log("info", "Сессия Blogabet восстановлена, storage state обновлён.")
+        except Exception:  # noqa: BLE001
+            self._log("warning", "Не удалось сохранить обновлённый storage state Blogabet.")
+
+        await self._dismiss_age_confirmation(page)
+
     async def _select_sport(self, page: AsyncPage, *, sport_target: str, sport_title: str) -> None:
         sport_trigger_selector = SELECTORS.SPORT_TRIGGER_TEMPLATE.format(sport_target=sport_target)
         sport_trigger = page.locator(sport_trigger_selector)
@@ -2594,12 +2655,9 @@ class BlogabetPublisher:
             try:
                 await page.goto(self.cfg.upcoming_url, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(900)
-                current_url = normalize(page.url).lower()
-                if "login" in current_url:
-                    raise BlogabetAuthRequired(
-                        "Сессия Blogabet недействительна. Выполните ручной логин и сохраните storage state."
-                    )
                 await self._dismiss_age_confirmation(page)
+                # Само-восстановление сессии: при истёкших cookie логинимся заново.
+                await self._ensure_authenticated_or_relogin(page)
 
                 sport_key = _detect_match_sport_key(match, bet_intent)
                 sport_target = _sport_target(sport_key)

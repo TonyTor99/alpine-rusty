@@ -4,6 +4,17 @@
 .env.*.local
 parser_sources.json
 
+# Runtime state / данные, изменяемые приложением на сервере (не деплоим из git)
+blogabet_state.json
+ocr_cache.json
+blogabet_league_aliases.json
+blogabet_mismatches.jsonl
+debug/
+
+# Архивы / бэкапы
+*.zip
+blogabet_state.json.bak.*
+
 # Python
 __pycache__/
 *.py[cod]

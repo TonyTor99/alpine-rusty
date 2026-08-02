@@ -45,7 +45,8 @@ from ocr_client import OcrError, OcrSpaceClient
 
 app = Flask(__name__)
 logging.basicConfig(
-    level=getattr(logging, os.getenv("APP_LOG_LEVEL", "INFO").upper(), logging.INFO),
+    level=getattr(logging, os.getenv(
+        "APP_LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("alpinbet_parser")
@@ -61,8 +62,10 @@ def configure_message_edit_logger() -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "message_edits.log"
 
-    max_bytes_raw = (os.getenv("MESSAGE_EDIT_LOG_MAX_BYTES", "1048576") or "").strip()
-    backup_count_raw = (os.getenv("MESSAGE_EDIT_LOG_BACKUP_COUNT", "5") or "").strip()
+    max_bytes_raw = (
+        os.getenv("MESSAGE_EDIT_LOG_MAX_BYTES", "1048576") or "").strip()
+    backup_count_raw = (
+        os.getenv("MESSAGE_EDIT_LOG_BACKUP_COUNT", "5") or "").strip()
     try:
         max_bytes = max(1024, int(max_bytes_raw))
     except ValueError:
@@ -84,7 +87,8 @@ def configure_message_edit_logger() -> logging.Logger:
             encoding="utf-8",
         )
         file_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         )
         message_logger.addHandler(file_handler)
 
@@ -99,8 +103,10 @@ def configure_blogabet_error_logger() -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "blogabet_errors.log"
 
-    max_bytes_raw = (os.getenv("BLOGABET_ERROR_LOG_MAX_BYTES", "1048576") or "").strip()
-    backup_count_raw = (os.getenv("BLOGABET_ERROR_LOG_BACKUP_COUNT", "5") or "").strip()
+    max_bytes_raw = (
+        os.getenv("BLOGABET_ERROR_LOG_MAX_BYTES", "1048576") or "").strip()
+    backup_count_raw = (
+        os.getenv("BLOGABET_ERROR_LOG_BACKUP_COUNT", "5") or "").strip()
     try:
         max_bytes = max(1024, int(max_bytes_raw))
     except ValueError:
@@ -122,7 +128,8 @@ def configure_blogabet_error_logger() -> logging.Logger:
             encoding="utf-8",
         )
         file_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         )
         blogabet_logger.addHandler(file_handler)
 
@@ -151,6 +158,7 @@ def log_blogabet_exception(message: str, *args: Any) -> None:
     logger.exception(message, *args)
     blogabet_error_logger.exception(message, *args)
 
+
 DEFAULT_PARSER_URL = "https://alpinbet.com/dispatch/id1631660353/pbd-1-fon"
 DEFAULT_PARSE_ITEM_SELECTOR = ".rTableLine"
 DEFAULT_PANEL_CONTAINER_SELECTOR = ".panel-container"
@@ -170,9 +178,11 @@ MAX_PENDING_SETTLEMENT_CANDIDATES = 500
 DEFAULT_BLOGABET_STORAGE_STATE_PATH = "./blogabet_state.json"
 DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH = "./blogabet_league_aliases.json"
 DEFAULT_BLOGABET_STAKE = 3
+DEFAULT_BLOGABET_RETRY_DELAY_SECONDS = 180
 BLOGABET_LEAGUE_ALIASES_FORMAT_VERSION = 1
 PARSER_DELIVERY_TELEGRAM_ENABLED_ENV = "PARSER_DELIVERY_TELEGRAM_ENABLED"
 PARSER_DELIVERY_VK_ENABLED_ENV = "PARSER_DELIVERY_VK_ENABLED"
+BLOGABET_RETRY_DELAY_SECONDS_ENV = "BLOGABET_RETRY_DELAY_SECONDS"
 
 
 @dataclass
@@ -181,6 +191,7 @@ class TargetConfig:
     data_url: str
     open_login_selector: str
     login_username: str
+    login_password: str
     email_selector: str
     password_selector: str
     submit_selector: str
@@ -309,11 +320,24 @@ class ParserSource:
     source_id: str
     url: str
     chat_id: str = ""
+    telegram_chat_ids: tuple[str, ...] = ()
     vk_chat_ids: tuple[str, ...] = ()
     enabled: bool = True
     telegram_enabled: bool = True
     vk_enabled: bool = True
     blogabet_enabled: bool = True
+
+
+@dataclass
+class BlogabetRetryItem:
+    source: ParserSource
+    match: ParsedMatch
+    target_chat_id: str
+    delivery_key: str
+    attempt_no: int
+    next_retry_at_monotonic: float
+    last_error: str = ""
+    bet_raw_text: str = ""
 
 
 @dataclass
@@ -351,6 +375,10 @@ class BrowserState:
         self.error: str = ""
         self.info: str = ""
 
+        # Пароль alpinbet, введённый на шаге логина; сохраняем в .env после
+        # подтверждения входа (в т.ч. после ввода 2FA-кода).
+        self.pending_login_password: str = ""
+
         self.preview: str = ""
         self.last_message_id: Optional[int] = None
 
@@ -364,6 +392,9 @@ class BrowserState:
         self.parser_interval_initialized: bool = False
         self.parser_page_max_age_seconds: int = DEFAULT_PARSER_PAGE_MAX_AGE_SECONDS
         self.parser_page_max_age_initialized: bool = False
+        self.blogabet_retry_delay_seconds: int = DEFAULT_BLOGABET_RETRY_DELAY_SECONDS
+        self.blogabet_retry_delay_initialized: bool = False
+        self.blogabet_retry_queue_size: int = 0
         self.pending_match_keys: set[str] = set()
         self.pending_settlement_keys: set[str] = set()
 
@@ -452,6 +483,9 @@ class BrowserState:
             self.parser_interval_initialized = False
             self.parser_page_max_age_seconds = DEFAULT_PARSER_PAGE_MAX_AGE_SECONDS
             self.parser_page_max_age_initialized = False
+            self.blogabet_retry_delay_seconds = DEFAULT_BLOGABET_RETRY_DELAY_SECONDS
+            self.blogabet_retry_delay_initialized = False
+            self.blogabet_retry_queue_size = 0
             self.pending_match_keys = set()
             self.pending_settlement_keys = set()
             self.parser_last_check_at = ""
@@ -623,11 +657,27 @@ def upsert_env_value(key: str, value: str, env_path: Optional[Path] = None) -> N
         )
 
 
+def save_target_login_password(password: str) -> None:
+    """Сохраняет последний успешный пароль alpinbet в .env (TARGET_LOGIN_PASSWORD)."""
+    password = (password or "").strip()
+    if not password:
+        return
+    if os.getenv("TARGET_LOGIN_PASSWORD", "") == password:
+        return
+    try:
+        upsert_env_value("TARGET_LOGIN_PASSWORD", password)
+        os.environ["TARGET_LOGIN_PASSWORD"] = password
+        logger.info("Пароль alpinbet сохранён в .env (TARGET_LOGIN_PASSWORD)")
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось сохранить TARGET_LOGIN_PASSWORD в .env")
+
+
 def resolve_blogabet_league_aliases_path() -> Path:
     load_dotenv()
     return Path(
         resolve_local_path(
-            os.getenv("BLOGABET_LEAGUE_ALIASES_PATH", DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH),
+            os.getenv("BLOGABET_LEAGUE_ALIASES_PATH",
+                      DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH),
             DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH,
         )
     )
@@ -842,6 +892,18 @@ def parse_min_seconds_value(
     return seconds
 
 
+def load_blogabet_retry_delay_seconds() -> int:
+    load_dotenv()
+    return parse_min_seconds_value(
+        os.getenv(
+            BLOGABET_RETRY_DELAY_SECONDS_ENV,
+            str(DEFAULT_BLOGABET_RETRY_DELAY_SECONDS),
+        ),
+        field_label="Интервал повтора Blogabet",
+        minimum_seconds=10,
+    )
+
+
 def normalize_source_url(url: str) -> str:
     normalized = normalize_text(url)
     if normalized.endswith("/"):
@@ -861,7 +923,8 @@ def validate_chat_id(chat_id: str) -> str:
         return normalized_chat_id
     if re.fullmatch(r"-?\d+", normalized_chat_id):
         return normalized_chat_id
-    raise ValueError("chat_id должен быть числом (например -100...) или @username")
+    raise ValueError(
+        "chat_id должен быть числом (например -100...) или @username")
 
 
 def normalize_vk_chat_id(chat_id: str) -> str:
@@ -902,6 +965,15 @@ def parse_telegram_chat_ids(raw_value: str, *, require_non_empty: bool = False) 
     return tuple(validated)
 
 
+def parser_source_telegram_chat_ids(source: ParserSource) -> tuple[str, ...]:
+    if source.telegram_chat_ids:
+        return tuple(source.telegram_chat_ids)
+    normalized_chat_id = normalize_chat_id(source.chat_id)
+    if normalized_chat_id:
+        return (normalized_chat_id,)
+    return ()
+
+
 def parse_vk_chat_ids(raw_value: str, *, require_non_empty: bool = False) -> tuple[str, ...]:
     raw_chat_ids = split_chat_ids(raw_value)
     validated: list[str] = []
@@ -934,8 +1006,9 @@ def compose_platform_delivery_key(
 
 def iter_source_delivery_targets(source: ParserSource) -> list[tuple[str, str]]:
     targets: list[tuple[str, str]] = []
-    if source.telegram_enabled and is_telegram_delivery_enabled() and normalize_chat_id(source.chat_id):
-        targets.append(("telegram", source.chat_id))
+    if source.telegram_enabled and is_telegram_delivery_enabled():
+        for chat_id in parser_source_telegram_chat_ids(source):
+            targets.append(("telegram", chat_id))
     if source.vk_enabled and is_vk_delivery_enabled():
         for chat_id in source.vk_chat_ids:
             targets.append(("vk", chat_id))
@@ -984,7 +1057,8 @@ def build_vk_plain_text_from_html(message_html: str) -> str:
 
     def _replace_link(match: re.Match[str]) -> str:
         raw_href = html.unescape(match.group(1) or "")
-        raw_caption = html.unescape(re.sub(r"<[^>]+>", "", match.group(2) or ""))
+        raw_caption = html.unescape(
+            re.sub(r"<[^>]+>", "", match.group(2) or ""))
         href = normalize_text(raw_href)
         caption = normalize_text(raw_caption)
         if caption and href:
@@ -1111,7 +1185,8 @@ def append_settlement_footer(message_text: str, footer_line: str) -> str:
 class MatchTrackingStore:
     def __init__(self, database_url: str) -> None:
         self.lock = threading.RLock()
-        self.database_url = normalize_text(database_url) or DEFAULT_MATCH_DATABASE_URL
+        self.database_url = normalize_text(
+            database_url) or DEFAULT_MATCH_DATABASE_URL
         self.backend = ""
         self.connection: Any = None
         self._connect()
@@ -1775,9 +1850,12 @@ class MatchTrackingStore:
         )
         updates: list[tuple[str, SettledMatchSnapshot]] = []
         for row in disappeared_rows:
-            match_unique_key = normalize_text(str(row.get("match_unique_key", "")))
-            match_signature = normalize_text(str(row.get("match_signature", "")))
-            match_lookup_key = normalize_text(str(row.get("match_lookup_key", "")))
+            match_unique_key = normalize_text(
+                str(row.get("match_unique_key", "")))
+            match_signature = normalize_text(
+                str(row.get("match_signature", "")))
+            match_lookup_key = normalize_text(
+                str(row.get("match_lookup_key", "")))
             if not match_unique_key:
                 continue
 
@@ -1863,7 +1941,8 @@ class MatchTrackingStore:
             except (TypeError, ValueError):
                 counters[status_name] = 0
 
-        total_row = self._fetchone("SELECT COUNT(*) AS row_count FROM tracked_matches")
+        total_row = self._fetchone(
+            "SELECT COUNT(*) AS row_count FROM tracked_matches")
         if total_row is not None:
             try:
                 counters["total_matches"] = int(total_row.get("row_count", 0))
@@ -1885,7 +1964,8 @@ class MatchTrackingStore:
         )
         if pending_row is not None:
             try:
-                counters["pending_settlement"] = int(pending_row.get("row_count", 0))
+                counters["pending_settlement"] = int(
+                    pending_row.get("row_count", 0))
             except (TypeError, ValueError):
                 counters["pending_settlement"] = 0
 
@@ -1895,7 +1975,8 @@ class MatchTrackingStore:
         with self.lock:
             cursor = self.connection.cursor()
             try:
-                cursor.execute(self._sql("DELETE FROM tracked_match_deliveries"))
+                cursor.execute(
+                    self._sql("DELETE FROM tracked_match_deliveries"))
                 cursor.execute(self._sql("DELETE FROM tracked_matches"))
                 self.connection.commit()
             except Exception:  # noqa: BLE001
@@ -2056,6 +2137,7 @@ def clone_parser_sources(sources: list[ParserSource]) -> list[ParserSource]:
             source_id=source.source_id,
             url=source.url,
             chat_id=source.chat_id,
+            telegram_chat_ids=parser_source_telegram_chat_ids(source),
             vk_chat_ids=tuple(source.vk_chat_ids),
             enabled=source.enabled,
             telegram_enabled=source.telegram_enabled,
@@ -2073,6 +2155,7 @@ def write_parser_sources_to_storage(sources: list[ParserSource]) -> None:
             "source_id": source.source_id,
             "url": source.url,
             "chat_id": source.chat_id,
+            "telegram_chat_ids": list(parser_source_telegram_chat_ids(source)),
             "vk_chat_ids": list(source.vk_chat_ids),
             "vk_chat_id": source.vk_chat_ids[0] if source.vk_chat_ids else "",
             "enabled": source.enabled,
@@ -2121,13 +2204,27 @@ def load_parser_sources_from_storage() -> list[ParserSource]:
         if source_url in seen_urls:
             continue
 
-        chat_id_raw = normalize_chat_id(str(item.get("chat_id", "")))
-        if chat_id_raw:
-            try:
-                chat_id_raw = validate_chat_id(chat_id_raw)
-            except Exception:  # noqa: BLE001
-                logger.warning("Пропущен источник с некорректным chat_id: %s", source_url)
-                continue
+        raw_telegram_chat_ids = item.get(
+            "telegram_chat_ids",
+            item.get("telegram_chat_id", item.get("chat_id", "")),
+        )
+        if isinstance(raw_telegram_chat_ids, list):
+            telegram_input = "\n".join(
+                str(value) for value in raw_telegram_chat_ids)
+        else:
+            telegram_input = str(raw_telegram_chat_ids or "")
+        try:
+            telegram_chat_ids = parse_telegram_chat_ids(
+                telegram_input,
+                require_non_empty=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Пропущен источник с некорректными Telegram chat_id: %s",
+                source_url,
+            )
+            continue
+        chat_id_raw = telegram_chat_ids[0] if telegram_chat_ids else ""
 
         raw_vk_chat_ids = item.get("vk_chat_ids", item.get("vk_chat_id", ""))
         if isinstance(raw_vk_chat_ids, list):
@@ -2137,7 +2234,8 @@ def load_parser_sources_from_storage() -> list[ParserSource]:
         try:
             vk_chat_ids = parse_vk_chat_ids(vk_input, require_non_empty=False)
         except Exception:  # noqa: BLE001
-            logger.warning("Пропущен источник с некорректными VK chat_id: %s", source_url)
+            logger.warning(
+                "Пропущен источник с некорректными VK chat_id: %s", source_url)
             continue
 
         source_enabled = bool(item.get("enabled", True))
@@ -2171,6 +2269,7 @@ def load_parser_sources_from_storage() -> list[ParserSource]:
                 source_id=source_id,
                 url=source_url,
                 chat_id=chat_id_raw,
+                telegram_chat_ids=telegram_chat_ids,
                 vk_chat_ids=vk_chat_ids,
                 enabled=source_enabled,
                 telegram_enabled=source_telegram_enabled,
@@ -2186,11 +2285,13 @@ def load_parser_sources_from_storage() -> list[ParserSource]:
 def ensure_parser_runtime_defaults(cfg: TargetConfig) -> None:
     with state.lock:
         if not state.parser_interval_initialized:
-            state.parser_interval_seconds = max(cfg.parser_interval_seconds, 10)
+            state.parser_interval_seconds = max(
+                cfg.parser_interval_seconds, 10)
             state.parser_interval_initialized = True
 
         if not state.parser_page_max_age_initialized:
-            state.parser_page_max_age_seconds = max(cfg.parser_page_max_age_seconds, 10)
+            state.parser_page_max_age_seconds = max(
+                cfg.parser_page_max_age_seconds, 10)
             state.parser_page_max_age_initialized = True
 
         if not state.parser_sources:
@@ -2200,13 +2301,27 @@ def ensure_parser_runtime_defaults(cfg: TargetConfig) -> None:
                 state.parser_source_seq = len(persisted_sources)
 
 
+def ensure_blogabet_retry_runtime_defaults() -> None:
+    with state.lock:
+        if state.blogabet_retry_delay_initialized:
+            return
+
+    retry_delay_seconds = load_blogabet_retry_delay_seconds()
+    with state.lock:
+        if not state.blogabet_retry_delay_initialized:
+            state.blogabet_retry_delay_seconds = retry_delay_seconds
+            state.blogabet_retry_delay_initialized = True
+
+
 def add_parser_source(url: str, chat_id: str, vk_chat_ids_raw: str = "") -> tuple[bool, ParserSource]:
     normalized_url = normalize_source_url(url)
     if not normalized_url:
         raise ValueError("Ссылка не задана")
     if not normalized_url.startswith(("http://", "https://")):
         raise ValueError("Ссылка должна начинаться с http:// или https://")
-    normalized_chat_id = validate_chat_id(chat_id)
+    telegram_chat_ids = parse_telegram_chat_ids(
+        chat_id, require_non_empty=True)
+    normalized_chat_id = telegram_chat_ids[0]
     vk_chat_ids = parse_vk_chat_ids(vk_chat_ids_raw, require_non_empty=False)
     is_added = False
 
@@ -2214,12 +2329,14 @@ def add_parser_source(url: str, chat_id: str, vk_chat_ids_raw: str = "") -> tupl
         for source in state.parser_sources:
             if normalize_source_url(source.url) == normalized_url:
                 source.chat_id = normalized_chat_id
+                source.telegram_chat_ids = telegram_chat_ids
                 source.vk_chat_ids = vk_chat_ids
                 snapshot = clone_parser_sources(state.parser_sources)
                 updated_source = ParserSource(
                     source_id=source.source_id,
                     url=source.url,
                     chat_id=source.chat_id,
+                    telegram_chat_ids=source.telegram_chat_ids,
                     vk_chat_ids=source.vk_chat_ids,
                     enabled=source.enabled,
                     telegram_enabled=source.telegram_enabled,
@@ -2233,6 +2350,7 @@ def add_parser_source(url: str, chat_id: str, vk_chat_ids_raw: str = "") -> tupl
                 source_id=str(state.parser_source_seq),
                 url=normalized_url,
                 chat_id=normalized_chat_id,
+                telegram_chat_ids=telegram_chat_ids,
                 vk_chat_ids=vk_chat_ids,
                 enabled=True,
                 telegram_enabled=True,
@@ -2259,6 +2377,7 @@ def toggle_parser_source(source_id: str) -> ParserSource:
                 source_id=source.source_id,
                 url=source.url,
                 chat_id=source.chat_id,
+                telegram_chat_ids=source.telegram_chat_ids,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
                 telegram_enabled=source.telegram_enabled,
@@ -2284,6 +2403,7 @@ def toggle_parser_source_blogabet(source_id: str) -> ParserSource:
                 source_id=source.source_id,
                 url=source.url,
                 chat_id=source.chat_id,
+                telegram_chat_ids=source.telegram_chat_ids,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
                 telegram_enabled=source.telegram_enabled,
@@ -2309,6 +2429,7 @@ def toggle_parser_source_telegram(source_id: str) -> ParserSource:
                 source_id=source.source_id,
                 url=source.url,
                 chat_id=source.chat_id,
+                telegram_chat_ids=source.telegram_chat_ids,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
                 telegram_enabled=source.telegram_enabled,
@@ -2334,6 +2455,7 @@ def toggle_parser_source_vk(source_id: str) -> ParserSource:
                 source_id=source.source_id,
                 url=source.url,
                 chat_id=source.chat_id,
+                telegram_chat_ids=source.telegram_chat_ids,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
                 telegram_enabled=source.telegram_enabled,
@@ -2364,18 +2486,22 @@ def remove_parser_source(source_id: str) -> ParserSource:
 
 
 def update_parser_source_chat_id(source_id: str, chat_id: str) -> ParserSource:
-    normalized_chat_id = validate_chat_id(chat_id)
+    telegram_chat_ids = parse_telegram_chat_ids(
+        chat_id, require_non_empty=True)
+    normalized_chat_id = telegram_chat_ids[0]
 
     with state.lock:
         for source in state.parser_sources:
             if source.source_id != source_id:
                 continue
             source.chat_id = normalized_chat_id
+            source.telegram_chat_ids = telegram_chat_ids
             snapshot = clone_parser_sources(state.parser_sources)
             updated = ParserSource(
                 source_id=source.source_id,
                 url=source.url,
                 chat_id=source.chat_id,
+                telegram_chat_ids=source.telegram_chat_ids,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
                 telegram_enabled=source.telegram_enabled,
@@ -2403,6 +2529,7 @@ def update_parser_source_vk_chat_ids(source_id: str, vk_chat_ids_raw: str) -> Pa
                 source_id=source.source_id,
                 url=source.url,
                 chat_id=source.chat_id,
+                telegram_chat_ids=source.telegram_chat_ids,
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
                 telegram_enabled=source.telegram_enabled,
@@ -2424,7 +2551,8 @@ def load_target_config() -> TargetConfig:
         "PARSER_INTERVAL_SECONDS",
         str(DEFAULT_PARSER_INTERVAL_SECONDS),
     ).strip()
-    parser_interval_seconds = parse_interval_seconds(interval_raw, clamp_min=True)
+    parser_interval_seconds = parse_interval_seconds(
+        interval_raw, clamp_min=True)
     page_max_age_raw = os.getenv(
         "PARSER_PAGE_MAX_AGE_SECONDS",
         str(DEFAULT_PARSER_PAGE_MAX_AGE_SECONDS),
@@ -2466,6 +2594,7 @@ def load_target_config() -> TargetConfig:
         open_login_selector=os.getenv(
             "TARGET_OPEN_LOGIN_SELECTOR", "").strip(),
         login_username=os.getenv("TARGET_LOGIN_USERNAME", "").strip(),
+        login_password=os.getenv("TARGET_LOGIN_PASSWORD", ""),
         email_selector=os.getenv(
             "TARGET_EMAIL_SELECTOR", "#loginform-username").strip(),
         password_selector=os.getenv(
@@ -2538,9 +2667,11 @@ def load_telegram_config() -> TelegramConfig:
     try:
         request_timeout_seconds = int(timeout_raw)
     except ValueError as exc:
-        raise ValueError("TELEGRAM_REQUEST_TIMEOUT_SECONDS должен быть числом") from exc
+        raise ValueError(
+            "TELEGRAM_REQUEST_TIMEOUT_SECONDS должен быть числом") from exc
     if request_timeout_seconds <= 0:
-        raise ValueError("TELEGRAM_REQUEST_TIMEOUT_SECONDS должен быть больше 0")
+        raise ValueError(
+            "TELEGRAM_REQUEST_TIMEOUT_SECONDS должен быть больше 0")
     use_system_proxy = parse_bool_env(
         os.getenv("TELEGRAM_USE_SYSTEM_PROXY", "0"),
         default=False,
@@ -2569,11 +2700,13 @@ def load_vk_config() -> VkConfig:
     try:
         request_timeout_seconds = int(timeout_raw)
     except ValueError as exc:
-        raise ValueError("VK_REQUEST_TIMEOUT_SECONDS должен быть числом") from exc
+        raise ValueError(
+            "VK_REQUEST_TIMEOUT_SECONDS должен быть числом") from exc
     if request_timeout_seconds <= 0:
         raise ValueError("VK_REQUEST_TIMEOUT_SECONDS должен быть больше 0")
 
-    api_version = normalize_text(os.getenv("VK_API_VERSION", DEFAULT_VK_API_VERSION))
+    api_version = normalize_text(
+        os.getenv("VK_API_VERSION", DEFAULT_VK_API_VERSION))
     if not api_version:
         api_version = DEFAULT_VK_API_VERSION
 
@@ -2603,22 +2736,28 @@ def load_blogabet_config() -> BlogabetConfig:
 
     enabled = parse_bool_env(os.getenv("BLOGABET_ENABLED", "0"), default=False)
     storage_state_path = resolve_local_path(
-        os.getenv("BLOGABET_STORAGE_STATE_PATH", DEFAULT_BLOGABET_STORAGE_STATE_PATH),
+        os.getenv("BLOGABET_STORAGE_STATE_PATH",
+                  DEFAULT_BLOGABET_STORAGE_STATE_PATH),
         DEFAULT_BLOGABET_STORAGE_STATE_PATH,
     )
     league_aliases_path = resolve_local_path(
-        os.getenv("BLOGABET_LEAGUE_ALIASES_PATH", DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH),
+        os.getenv("BLOGABET_LEAGUE_ALIASES_PATH",
+                  DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH),
         DEFAULT_BLOGABET_LEAGUE_ALIASES_PATH,
     )
-    headless = parse_bool_env(os.getenv("BLOGABET_HEADLESS", "1"), default=True)
+    headless = parse_bool_env(
+        os.getenv("BLOGABET_HEADLESS", "1"), default=True)
 
-    stake_raw = normalize_text(os.getenv("BLOGABET_DEFAULT_STAKE", str(DEFAULT_BLOGABET_STAKE)))
+    stake_raw = normalize_text(
+        os.getenv("BLOGABET_DEFAULT_STAKE", str(DEFAULT_BLOGABET_STAKE)))
     try:
         default_stake = int(stake_raw)
     except ValueError as exc:
-        raise ValueError("BLOGABET_DEFAULT_STAKE должен быть целым числом") from exc
+        raise ValueError(
+            "BLOGABET_DEFAULT_STAKE должен быть целым числом") from exc
     if default_stake < 1 or default_stake > 10:
-        raise ValueError("BLOGABET_DEFAULT_STAKE должен быть в диапазоне 1..10")
+        raise ValueError(
+            "BLOGABET_DEFAULT_STAKE должен быть в диапазоне 1..10")
 
     interactive_timeout_raw = normalize_text(
         os.getenv("BLOGABET_INTERACTIVE_LOGIN_TIMEOUT_SECONDS", "600")
@@ -2637,12 +2776,15 @@ def load_blogabet_config() -> BlogabetConfig:
         storage_state_path=storage_state_path,
         headless=headless,
         default_stake=default_stake,
-        admin_tg_chat_id=normalize_text(os.getenv("BLOGABET_ADMIN_TG_CHAT_ID", "")),
+        admin_tg_chat_id=normalize_text(
+            os.getenv("BLOGABET_ADMIN_TG_CHAT_ID", "")),
         league_aliases_path=league_aliases_path,
         upcoming_url=normalize_text(
-            os.getenv("BLOGABET_UPCOMING_URL", "https://blogabet.com/pinnacle/live")
+            os.getenv("BLOGABET_UPCOMING_URL",
+                      "https://blogabet.com/pinnacle/live")
         ) or "https://blogabet.com/pinnacle/live",
-        login_url=normalize_text(os.getenv("BLOGABET_LOGIN_URL", "https://blogabet.com"))
+        login_url=normalize_text(
+            os.getenv("BLOGABET_LOGIN_URL", "https://blogabet.com"))
         or "https://blogabet.com",
         interactive_login_timeout_seconds=interactive_login_timeout_seconds,
         login_email=(os.getenv("BLOGABET_LOGIN_EMAIL", "") or "").strip(),
@@ -2661,13 +2803,15 @@ def load_ocr_client() -> OcrSpaceClient:
     try:
         timeout_seconds = int(timeout_raw)
     except ValueError as exc:
-        raise ValueError("OCR_SPACE_TIMEOUT_SECONDS должен быть целым числом") from exc
+        raise ValueError(
+            "OCR_SPACE_TIMEOUT_SECONDS должен быть целым числом") from exc
     if timeout_seconds <= 0:
         raise ValueError("OCR_SPACE_TIMEOUT_SECONDS должен быть больше 0")
 
     return OcrSpaceClient(
         api_key=api_key,
-        cache_path=normalize_text(os.getenv("OCR_CACHE_PATH", "./ocr_cache.json"))
+        cache_path=normalize_text(
+            os.getenv("OCR_CACHE_PATH", "./ocr_cache.json"))
         or "./ocr_cache.json",
         request_timeout_seconds=timeout_seconds,
         use_system_proxy=parse_bool_env(
@@ -2767,6 +2911,56 @@ def build_blogabet_admin_alert_message(
     )
 
 
+def current_blogabet_retry_delay_seconds() -> int:
+    with state.lock:
+        if state.blogabet_retry_delay_initialized:
+            return max(state.blogabet_retry_delay_seconds, 10)
+    return DEFAULT_BLOGABET_RETRY_DELAY_SECONDS
+
+
+def set_blogabet_retry_queue_size(queue_size: int) -> None:
+    with state.lock:
+        state.blogabet_retry_queue_size = max(0, queue_size)
+
+
+def enqueue_blogabet_retry(
+    retry_queue: list[BlogabetRetryItem],
+    item: BlogabetRetryItem,
+) -> None:
+    retry_queue[:] = [
+        existing
+        for existing in retry_queue
+        if existing.delivery_key != item.delivery_key
+    ]
+    retry_queue.append(item)
+    retry_queue.sort(key=lambda queued: queued.next_retry_at_monotonic)
+    set_blogabet_retry_queue_size(len(retry_queue))
+    logger.info(
+        "Blogabet ставка добавлена в очередь повтора. delivery_key=%s attempt=%s retry_in=%.1f error=%s",
+        item.delivery_key,
+        item.attempt_no,
+        max(0.0, item.next_retry_at_monotonic - time.monotonic()),
+        item.last_error,
+    )
+
+
+def pop_due_blogabet_retries(
+    retry_queue: list[BlogabetRetryItem],
+    now_monotonic: float,
+) -> list[BlogabetRetryItem]:
+    due_items: list[BlogabetRetryItem] = []
+    pending_items: list[BlogabetRetryItem] = []
+    for item in retry_queue:
+        if item.next_retry_at_monotonic <= now_monotonic:
+            due_items.append(item)
+        else:
+            pending_items.append(item)
+    if due_items:
+        retry_queue[:] = pending_items
+        set_blogabet_retry_queue_size(len(retry_queue))
+    return due_items
+
+
 def detect_match_sport(match: ParsedMatch) -> tuple[str, str]:
     text_parts = [
         match.tournament,
@@ -2775,7 +2969,8 @@ def detect_match_sport(match: ParsedMatch) -> tuple[str, str]:
         match.rate_description,
         match.href,
     ]
-    normalized_text_parts = [normalize_text(value).lower() for value in text_parts]
+    normalized_text_parts = [normalize_text(
+        value).lower() for value in text_parts]
     search_blob = " ".join(part for part in normalized_text_parts if part)
 
     basketball_markers = (
@@ -3076,7 +3271,8 @@ def build_weekly_stats_message(snapshot: WeeklyStatsSnapshot) -> str:
     day_lines: list[str] = []
     for day_item in snapshot.day_items:
         parsed_day = parse_stats_date(day_item.stats_date)
-        day_label = parsed_day.strftime("%d.%m") if parsed_day is not None else day_item.stats_date
+        day_label = parsed_day.strftime(
+            "%d.%m") if parsed_day is not None else day_item.stats_date
         day_lines.append(
             f"{day_label} "
             f"{settlement_status_icon(day_item.settlement_status)}"
@@ -3158,16 +3354,19 @@ async def telegram_api_post(
                     f"Telegram API вернул некорректный JSON: {raw_payload[:180]}"
                 ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Ошибка запроса в Telegram API: {format_exception_details(exc)}") from exc
+        raise RuntimeError(
+            f"Ошибка запроса в Telegram API: {format_exception_details(exc)}") from exc
 
     if not isinstance(data, dict):
         raise RuntimeError("Telegram API вернул неожиданный формат ответа")
 
     if not data.get("ok"):
-        description = normalize_text(str(data.get("description", "unknown error")))
+        description = normalize_text(
+            str(data.get("description", "unknown error")))
         error_code = data.get("error_code")
         if error_code is not None:
-            raise RuntimeError(f"Telegram API error {error_code}: {description or 'unknown error'}")
+            raise RuntimeError(
+                f"Telegram API error {error_code}: {description or 'unknown error'}")
         raise RuntimeError(description or "Telegram API request failed")
 
     if status_code >= 400:
@@ -3210,16 +3409,19 @@ async def telegram_api_post_multipart(
                     f"Telegram API вернул некорректный JSON: {raw_payload[:180]}"
                 ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Ошибка запроса в Telegram API: {format_exception_details(exc)}") from exc
+        raise RuntimeError(
+            f"Ошибка запроса в Telegram API: {format_exception_details(exc)}") from exc
 
     if not isinstance(data, dict):
         raise RuntimeError("Telegram API вернул неожиданный формат ответа")
 
     if not data.get("ok"):
-        description = normalize_text(str(data.get("description", "unknown error")))
+        description = normalize_text(
+            str(data.get("description", "unknown error")))
         error_code = data.get("error_code")
         if error_code is not None:
-            raise RuntimeError(f"Telegram API error {error_code}: {description or 'unknown error'}")
+            raise RuntimeError(
+                f"Telegram API error {error_code}: {description or 'unknown error'}")
         raise RuntimeError(description or "Telegram API request failed")
 
     if status_code >= 400:
@@ -3251,7 +3453,8 @@ async def vk_api_post(
                     f"VK API вернул некорректный JSON: {raw_payload[:180]}"
                 ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Ошибка запроса в VK API: {format_exception_details(exc)}") from exc
+        raise RuntimeError(
+            f"Ошибка запроса в VK API: {format_exception_details(exc)}") from exc
 
     if not isinstance(data, dict):
         raise RuntimeError("VK API вернул неожиданный формат ответа")
@@ -3259,9 +3462,11 @@ async def vk_api_post(
     error_payload = data.get("error")
     if isinstance(error_payload, dict):
         error_code = error_payload.get("error_code")
-        error_msg = normalize_text(str(error_payload.get("error_msg", "unknown error")))
+        error_msg = normalize_text(
+            str(error_payload.get("error_msg", "unknown error")))
         if error_code is not None:
-            raise RuntimeError(f"VK API error {error_code}: {error_msg or 'unknown error'}")
+            raise RuntimeError(
+                f"VK API error {error_code}: {error_msg or 'unknown error'}")
         raise RuntimeError(error_msg or "VK API request failed")
 
     if status_code >= 400:
@@ -3311,7 +3516,8 @@ async def fetch_vk_chat_peer_ids(
         title = "Без названия"
         chat_settings = conversation.get("chat_settings")
         if isinstance(chat_settings, dict):
-            title_candidate = normalize_text(str(chat_settings.get("title", "")))
+            title_candidate = normalize_text(
+                str(chat_settings.get("title", "")))
             if title_candidate:
                 title = title_candidate
 
@@ -3338,11 +3544,14 @@ async def download_image_bytes(
             content = await response.read()
             if not content:
                 raise RuntimeError("empty image content")
-            content_type = normalize_text(response.headers.get("Content-Type", "image/jpeg"))
-            normalized_content_type = content_type.split(";")[0].strip() or "image/jpeg"
+            content_type = normalize_text(
+                response.headers.get("Content-Type", "image/jpeg"))
+            normalized_content_type = content_type.split(
+                ";")[0].strip() or "image/jpeg"
             return content, normalized_content_type
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Не удалось скачать изображение: {format_exception_details(exc)}") from exc
+        raise RuntimeError(
+            f"Не удалось скачать изображение: {format_exception_details(exc)}") from exc
 
 
 async def send_telegram_match_message(
@@ -3356,12 +3565,14 @@ async def send_telegram_match_message(
 ) -> int:
     target_chat_id = validate_chat_id(chat_id)
     normalized_image_url = normalize_text(image_url)
-    is_external_image_url = normalized_image_url.startswith(("http://", "https://"))
+    is_external_image_url = normalized_image_url.startswith(
+        ("http://", "https://"))
     normalized_parse_mode = normalize_text(parse_mode)
     photo_errors: list[str] = []
 
     if require_photo and not is_external_image_url:
-        raise ValueError("Нельзя отправить матч без корректного URL изображения")
+        raise ValueError(
+            "Нельзя отправить матч без корректного URL изображения")
 
     if is_external_image_url:
         caption = text if len(text) <= 1024 else text[:1021] + "..."
@@ -3462,7 +3673,8 @@ async def upload_vk_message_photo_from_url(
     )
     if not isinstance(upload_server_response, dict):
         raise RuntimeError("VK API не вернул upload_url")
-    upload_url = normalize_text(str(upload_server_response.get("upload_url", "")))
+    upload_url = normalize_text(
+        str(upload_server_response.get("upload_url", "")))
     if not upload_url.startswith(("http://", "https://")):
         raise RuntimeError("VK API вернул некорректный upload_url")
 
@@ -3487,7 +3699,8 @@ async def upload_vk_message_photo_from_url(
                     f"VK upload вернул некорректный JSON: {raw_payload[:180]}"
                 ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Не удалось загрузить фото в VK: {format_exception_details(exc)}") from exc
+        raise RuntimeError(
+            f"Не удалось загрузить фото в VK: {format_exception_details(exc)}") from exc
 
     if not isinstance(upload_result, dict):
         raise RuntimeError("VK upload вернул неожиданный формат ответа")
@@ -3496,7 +3709,8 @@ async def upload_vk_message_photo_from_url(
     server = upload_result.get("server")
     upload_hash = normalize_text(str(upload_result.get("hash", "")))
     if not photo or server is None or not upload_hash:
-        raise RuntimeError("VK upload не вернул обязательные поля photo/server/hash")
+        raise RuntimeError(
+            "VK upload не вернул обязательные поля photo/server/hash")
 
     save_response = await vk_api_post(
         session,
@@ -3535,7 +3749,8 @@ async def send_vk_match_message(
 ) -> int:
     target_chat_id = validate_vk_chat_id(chat_id)
     normalized_image_url = normalize_text(image_url)
-    is_external_image_url = normalized_image_url.startswith(("http://", "https://"))
+    is_external_image_url = normalized_image_url.startswith(
+        ("http://", "https://"))
     attachment = ""
 
     if is_external_image_url:
@@ -3590,10 +3805,12 @@ def build_telegram_edit_html(
         link_match = re.search(r"https?://\S+", line)
         should_render_match_link = normalized_line.lower().startswith("🔗 ссылка на матч")
         if should_render_match_link:
-            target_url = normalize_text(link_match.group(0)) if link_match else fallback_url
+            target_url = normalize_text(link_match.group(
+                0)) if link_match else fallback_url
             if target_url.startswith(("http://", "https://")):
                 escaped_url = html.escape(target_url, quote=True)
-                escaped_lines.append(f'🔗 <a href="{escaped_url}">Ссылка на матч</a>')
+                escaped_lines.append(
+                    f'🔗 <a href="{escaped_url}">Ссылка на матч</a>')
                 has_link_line = True
                 continue
         escaped_lines.append(html.escape(line, quote=False))
@@ -3618,7 +3835,8 @@ async def edit_telegram_message(
     if not normalized_text:
         raise ValueError("Нельзя отправить пустое обновление сообщения")
 
-    caption_text = build_telegram_edit_html(normalized_text, match_url=match_url)
+    caption_text = build_telegram_edit_html(
+        normalized_text, match_url=match_url)
     if not caption_text:
         raise ValueError("Нельзя отправить пустое обновление сообщения")
     if len(caption_text) > 1024:
@@ -3663,7 +3881,8 @@ async def edit_telegram_message(
 
     text_error: Optional[Exception] = None
     try:
-        text_payload = build_telegram_edit_html(normalized_text, match_url=match_url)
+        text_payload = build_telegram_edit_html(
+            normalized_text, match_url=match_url)
         await telegram_api_post(
             session,
             tg_cfg,
@@ -3986,7 +4205,8 @@ async def ensure_scan_page_prefers_second(page: AsyncPage, parse_url: str) -> No
                 parse_qsl(urlsplit(current_url).query, keep_blank_values=True)
             )
             current_page_raw = normalize_text(current_query.get("page", ""))
-            current_page_number = int(current_page_raw) if current_page_raw.isdigit() else 1
+            current_page_number = int(
+                current_page_raw) if current_page_raw.isdigit() else 1
             if current_page_number > 1:
                 fallback_first_page_url = upsert_query_param(
                     parse_url,
@@ -4042,7 +4262,8 @@ async def ensure_scan_page_prefers_second(page: AsyncPage, parse_url: str) -> No
     )
     fallback_url = parse_url
     if raw_target_href:
-        fallback_url = remove_query_param(urljoin(parse_url, raw_target_href), "_pjax")
+        fallback_url = remove_query_param(
+            urljoin(parse_url, raw_target_href), "_pjax")
     fallback_url = upsert_query_param(
         fallback_url,
         "ForecastSearch[perPage]",
@@ -4128,7 +4349,8 @@ async def click_profit_tab(page: AsyncPage) -> None:
 
 async def click_profit_day_tab(page: AsyncPage) -> None:
     try:
-        active_day_panel = page.locator("#tab-day.active, #tab-day.active-content-div")
+        active_day_panel = page.locator(
+            "#tab-day.active, #tab-day.active-content-div")
         if await active_day_panel.count() > 0 and await active_day_panel.first.is_visible():
             return
     except Exception:  # noqa: BLE001
@@ -4162,7 +4384,8 @@ async def click_profit_day_tab(page: AsyncPage) -> None:
             return
     except Exception:  # noqa: BLE001
         pass
-    raise RuntimeError("Не удалось открыть дневную статистику во вкладке 'Прибыль'")
+    raise RuntimeError(
+        "Не удалось открыть дневную статистику во вкладке 'Прибыль'")
 
 
 async def click_profit_month_tab(page: AsyncPage) -> None:
@@ -4201,7 +4424,8 @@ async def click_profit_month_tab(page: AsyncPage) -> None:
             return
     except Exception:  # noqa: BLE001
         pass
-    raise RuntimeError("Не удалось открыть месячную статистику во вкладке 'Прибыль'")
+    raise RuntimeError(
+        "Не удалось открыть месячную статистику во вкладке 'Прибыль'")
 
 
 async def extract_daily_profit_rows(page: AsyncPage) -> list[dict[str, str]]:
@@ -4384,13 +4608,15 @@ async def fetch_weekly_profit_snapshot(
     current_day = week_start
     while current_day <= week_end:
         row = found_rows.get(current_day)
-        raw_profit_percent = row.get("profit_percent", "") if row is not None else "0.00%"
+        raw_profit_percent = row.get(
+            "profit_percent", "") if row is not None else "0.00%"
         profit_value = parse_percent_number(raw_profit_percent)
         total_profit_value += profit_value
         day_items.append(
             WeeklyStatsDaySnapshot(
                 stats_date=current_day.strftime("%d.%m.%Y"),
-                profit_percent=format_percent_value(profit_value, with_sign=True),
+                profit_percent=format_percent_value(
+                    profit_value, with_sign=True),
                 settlement_status=settlement_status_by_percent(profit_value),
             )
         )
@@ -4399,7 +4625,8 @@ async def fetch_weekly_profit_snapshot(
     return WeeklyStatsSnapshot(
         dispatch_title=dispatch_title_from_url(source_url),
         period_label=weekly_stats_period_label(week_start, week_end),
-        total_profit_percent=format_percent_value(total_profit_value, with_sign=False),
+        total_profit_percent=format_percent_value(
+            total_profit_value, with_sign=False),
         day_items=tuple(day_items),
         verifier_url=source_url,
     )
@@ -4427,7 +4654,8 @@ async def fetch_monthly_profit_snapshot(
     await click_profit_tab(page)
     await click_profit_month_tab(page)
 
-    expected_month_label = normalize_text(month_short_label(target_year, target_month))
+    expected_month_label = normalize_text(
+        month_short_label(target_year, target_month))
     for _ in range(DEFAULT_DAILY_STATS_LOOKUP_MAX_PAGES):
         monthly_rows = await extract_monthly_profit_rows(page)
         if not monthly_rows:
@@ -4441,7 +4669,8 @@ async def fetch_monthly_profit_snapshot(
             return MonthlyStatsSnapshot(
                 dispatch_title=dispatch_title_from_url(source_url),
                 month_label=row_label or expected_month_label,
-                profit_percent=normalize_percent_value(row.get("profit_percent", "")),
+                profit_percent=normalize_percent_value(
+                    row.get("profit_percent", "")),
                 verifier_url=source_url,
             )
         moved = await go_to_next_monthly_profit_page(page)
@@ -4489,7 +4718,8 @@ async def fetch_daily_profit_snapshot(
                 win_count=parse_int_from_text(row.get("win_count", "")),
                 lose_count=parse_int_from_text(row.get("lose_count", "")),
                 return_count=parse_int_from_text(row.get("return_count", "")),
-                profit_percent=normalize_percent_value(row.get("profit_percent", "")),
+                profit_percent=normalize_percent_value(
+                    row.get("profit_percent", "")),
                 verifier_url=source_url,
             )
         moved = await go_to_next_daily_profit_page(page)
@@ -4717,7 +4947,8 @@ async def parse_active_matches(
                 continue
 
             full_href = urljoin(source_url, href) if href else source_url
-            full_image_url = urljoin(source_url, image_url) if image_url else ""
+            full_image_url = urljoin(
+                source_url, image_url) if image_url else ""
             unique_key = "|".join(
                 [home_team, away_team, tournament, rate, rate_description, full_href])
 
@@ -4769,7 +5000,8 @@ def summarize_match_titles_for_log(
     if not matches:
         return ""
 
-    titles = [f"{match.home_team} - {match.away_team}" for match in matches[:limit]]
+    titles = [
+        f"{match.home_team} - {match.away_team}" for match in matches[:limit]]
     if len(matches) > limit:
         titles.append(f"+{len(matches) - limit} more")
     return "; ".join(titles)
@@ -5106,7 +5338,8 @@ async def parse_completed_matches(
             away_team = normalize_text(str(row.get("away_team", "")))
             tournament = normalize_text(str(row.get("tournament", "")))
             rate = normalize_text(str(row.get("rate", "")))
-            rate_description = normalize_text(str(row.get("rate_description", "")))
+            rate_description = normalize_text(
+                str(row.get("rate_description", "")))
             href = normalize_text(str(row.get("href", "")))
             score = normalize_text(str(row.get("score", "")))
             result_text = normalize_text(str(row.get("result_text", "")))
@@ -5215,7 +5448,8 @@ async def fetch_active_matches(
                 continue
             return best_matches
 
-        matches_with_images, matches_without_images = split_parsed_matches_by_image(matches)
+        matches_with_images, matches_without_images = split_parsed_matches_by_image(
+            matches)
         if matches_with_images:
             best_matches = matches_with_images
 
@@ -5380,9 +5614,9 @@ async def fetch_matches_for_source(
 
         source_runtime.last_match_count = len(source_matches)
         logger.info(
-            "Цикл парсера: источник=%s, tg_chat_id=%s, vk_chat_ids=%s, найдено матчей=%s, mode=%s",
+            "Цикл парсера: источник=%s, tg_chat_ids=%s, vk_chat_ids=%s, найдено матчей=%s, mode=%s",
             source.url,
-            source.chat_id,
+            len(parser_source_telegram_chat_ids(source)),
             len(source.vk_chat_ids),
             len(source_matches),
             mode,
@@ -5423,19 +5657,24 @@ async def deliver_match_notification(
     target_kind: str,
     target_chat_id: str,
     delivery_key: str,
+    blogabet_retry_queue: Optional[list[BlogabetRetryItem]] = None,
+    blogabet_retry_attempt: int = 0,
 ) -> None:
     message = build_active_match_message(match, source.url)
     telegram_message_html = build_active_match_message_html(match, source.url)
     platform_label = stats_target_label(target_kind)
     blogabet_bet_raw = match.rate_description
+    blogabet_can_retry = False
     stored_message_text = message
 
     try:
         if target_kind == "telegram":
             if tg_cfg is None:
-                raise RuntimeError("Telegram доставка отключена или конфигурация недоступна")
+                raise RuntimeError(
+                    "Telegram доставка отключена или конфигурация недоступна")
             if not normalize_text(match.image_url):
-                raise RuntimeError("У матча отсутствует обязательное изображение")
+                raise RuntimeError(
+                    "У матча отсутствует обязательное изображение")
             message_id = await send_telegram_match_message(
                 tg_session,
                 tg_cfg,
@@ -5473,7 +5712,9 @@ async def deliver_match_notification(
             )
             bet_intent = parse_bet_intent(ocr_text)
             blogabet_bet_raw = bet_intent.raw_text
-            analysis_text = build_blogabet_analysis_text(match, bet_intent, ocr_text)
+            analysis_text = build_blogabet_analysis_text(
+                match, bet_intent, ocr_text)
+            blogabet_can_retry = True
             publish_result = await blogabet_publisher.publish_pick(
                 match,
                 bet_intent,
@@ -5487,7 +5728,8 @@ async def deliver_match_notification(
             )
 
             if not publish_result.success:
-                raise RuntimeError("Blogabet вернул неуспешный результат публикации")
+                raise RuntimeError(
+                    "Blogabet вернул неуспешный результат публикации")
 
             pick_id = publish_result.pick_id or 0
             pick_url = normalize_text(publish_result.pick_url or "")
@@ -5496,7 +5738,8 @@ async def deliver_match_notification(
                 f"Blogabet pick for {match.home_team} - {match.away_team}"
             )
         else:
-            raise RuntimeError(f"Неизвестный тип канала доставки: {target_kind}")
+            raise RuntimeError(
+                f"Неизвестный тип канала доставки: {target_kind}")
 
         logger.info(
             "Сообщение отправлено. platform=%s chat_id=%s message_id=%s source=%s match=%s - %s",
@@ -5559,7 +5802,28 @@ async def deliver_match_notification(
                     now_storage_label_msk(),
                 )
             except Exception:  # noqa: BLE001
-                log_blogabet_exception("Не удалось сохранить failed-доставку Blogabet в БД")
+                log_blogabet_exception(
+                    "Не удалось сохранить failed-доставку Blogabet в БД")
+
+            queued_blogabet_retry = False
+            retry_delay_seconds = current_blogabet_retry_delay_seconds()
+            if blogabet_retry_queue is not None and blogabet_can_retry:
+                next_attempt_no = max(1, blogabet_retry_attempt + 1)
+                enqueue_blogabet_retry(
+                    blogabet_retry_queue,
+                    BlogabetRetryItem(
+                        source=source,
+                        match=match,
+                        target_chat_id=target_chat_id,
+                        delivery_key=delivery_key,
+                        attempt_no=next_attempt_no,
+                        next_retry_at_monotonic=time.monotonic()
+                        + retry_delay_seconds,
+                        last_error=error_details,
+                        bet_raw_text=blogabet_bet_raw,
+                    ),
+                )
+                queued_blogabet_retry = True
 
             raw_admin_chat_ids = blogabet_cfg.admin_tg_chat_id if blogabet_cfg else ""
             admin_chat_ids: tuple[str, ...] = ()
@@ -5571,11 +5835,19 @@ async def deliver_match_notification(
                     admin_exc,
                 )
 
-            if admin_chat_ids and tg_cfg is not None:
+            should_send_admin_alert = (
+                not queued_blogabet_retry or blogabet_retry_attempt == 0
+            )
+            if admin_chat_ids and tg_cfg is not None and should_send_admin_alert:
+                alert_error_details = error_details
+                if queued_blogabet_retry:
+                    alert_error_details = (
+                        f"{error_details}. Повтор через {retry_delay_seconds} сек."
+                    )
                 alert_message = build_blogabet_admin_alert_message(
                     match,
                     blogabet_bet_raw,
-                    error_details,
+                    alert_error_details,
                 )
                 for admin_chat_id in admin_chat_ids:
                     try:
@@ -5590,15 +5862,22 @@ async def deliver_match_notification(
                             "Не удалось отправить алерт админу о сбое Blogabet. chat_id=%s",
                             admin_chat_id,
                         )
-            elif admin_chat_ids and tg_cfg is None:
+            elif admin_chat_ids and tg_cfg is None and should_send_admin_alert:
                 log_blogabet_error(
                     "Админ-алерты Blogabet пропущены: Telegram доставка отключена или конфигурация недоступна"
                 )
 
         with state.lock:
+            retry_status = ""
+            if target_kind == "blogabet" and blogabet_can_retry:
+                retry_status = (
+                    f" | повтор через {current_blogabet_retry_delay_seconds()} сек"
+                    if blogabet_retry_queue is not None
+                    else ""
+                )
             state.parser_error = (
                 f"{now_label()} | Ошибка отправки в {platform_label} ({target_chat_id}): "
-                f"{error_details}"
+                f"{error_details}{retry_status}"
             )
     finally:
         with state.lock:
@@ -5627,7 +5906,8 @@ def reserve_settlement_candidates(
                 continue
             if message_id <= 0:
                 continue
-            tracked_status = normalize_text(str(row.get("tracked_status", ""))).lower()
+            tracked_status = normalize_text(
+                str(row.get("tracked_status", ""))).lower()
             tracked_settlement_status = normalize_text(
                 str(row.get("tracked_settlement_status", ""))
             ).lower()
@@ -5650,10 +5930,13 @@ def reserve_settlement_candidates(
                     chat_id=normalize_text(str(row.get("chat_id", ""))),
                     message_id=message_id,
                     message_text=str(row.get("message_text", "")),
-                    match_unique_key=normalize_text(str(row.get("match_unique_key", ""))),
-                    match_signature=normalize_text(str(row.get("match_signature", ""))),
+                    match_unique_key=normalize_text(
+                        str(row.get("match_unique_key", ""))),
+                    match_signature=normalize_text(
+                        str(row.get("match_signature", ""))),
                     match_href=normalize_text(str(row.get("match_href", ""))),
-                    match_lookup_key=normalize_text(str(row.get("match_lookup_key", ""))),
+                    match_lookup_key=normalize_text(
+                        str(row.get("match_lookup_key", ""))),
                     home_team=normalize_text(str(row.get("home_team", ""))),
                     away_team=normalize_text(str(row.get("away_team", ""))),
                     tracked_status=tracked_status,
@@ -5705,7 +5988,8 @@ async def deliver_settlement_update(
         settled_match.net_profit_units,
         settled_match.score,
     )
-    updated_message = append_settlement_footer(record.message_text, footer_line)
+    updated_message = append_settlement_footer(
+        record.message_text, footer_line)
 
     try:
         log_message_edit_info(
@@ -5803,8 +6087,10 @@ async def schedule_settlement_updates_for_source(
     should_check_completed_now = disappeared_count > 0
     now_monotonic = time.monotonic()
     interval_seconds = max(completed_fetch_interval_seconds, 10)
-    last_completed_fetch_at = completed_fetch_last_at.get(source.source_id, 0.0)
-    completed_fetch_due = (now_monotonic - last_completed_fetch_at) >= interval_seconds
+    last_completed_fetch_at = completed_fetch_last_at.get(
+        source.source_id, 0.0)
+    completed_fetch_due = (
+        now_monotonic - last_completed_fetch_at) >= interval_seconds
 
     if should_check_completed_now:
         logger.info(
@@ -5817,11 +6103,13 @@ async def schedule_settlement_updates_for_source(
         return 0
 
     if tg_cfg is None:
-        release_pending_settlement_keys([record.delivery_key for record in candidates])
+        release_pending_settlement_keys(
+            [record.delivery_key for record in candidates])
         return 0
 
     if not should_check_completed_now and not completed_fetch_due:
-        release_pending_settlement_keys([record.delivery_key for record in candidates])
+        release_pending_settlement_keys(
+            [record.delivery_key for record in candidates])
         return 0
 
     completed_page: Optional[AsyncPage] = None
@@ -5836,7 +6124,8 @@ async def schedule_settlement_updates_for_source(
         completed_fetch_last_at[source.source_id] = time.monotonic()
     except Exception:
         completed_fetch_last_at[source.source_id] = time.monotonic()
-        release_pending_settlement_keys([record.delivery_key for record in candidates])
+        release_pending_settlement_keys(
+            [record.delivery_key for record in candidates])
         raise
     finally:
         if completed_page is not None:
@@ -5902,7 +6191,8 @@ async def schedule_settlement_updates_for_source(
 
         if settled_match is None:
             unmatched_keys.append(record.delivery_key)
-            unmatched_records.append(f"{record.delivery_key}|message_id={record.message_id}")
+            unmatched_records.append(
+                f"{record.delivery_key}|message_id={record.message_id}")
             continue
 
         logger.info(
@@ -6219,13 +6509,15 @@ async def send_daily_stats_to_sources(
         parser_context = await parser_browser.new_context(storage_state=storage_state)
 
         if tg_cfg is not None:
-            tg_timeout = aiohttp.ClientTimeout(total=tg_cfg.request_timeout_seconds)
+            tg_timeout = aiohttp.ClientTimeout(
+                total=tg_cfg.request_timeout_seconds)
             tg_session = aiohttp.ClientSession(
                 timeout=tg_timeout,
                 trust_env=tg_cfg.use_system_proxy,
             )
         if vk_cfg is not None:
-            vk_timeout = aiohttp.ClientTimeout(total=vk_cfg.request_timeout_seconds)
+            vk_timeout = aiohttp.ClientTimeout(
+                total=vk_cfg.request_timeout_seconds)
             vk_session = aiohttp.ClientSession(
                 timeout=vk_timeout,
                 trust_env=vk_cfg.use_system_proxy,
@@ -6245,7 +6537,8 @@ async def send_daily_stats_to_sources(
                 message = build_daily_stats_message(daily_snapshot)
                 targets = iter_source_delivery_targets(source)
                 if not targets:
-                    source_errors.append(f"{source.url}: нет Telegram/VK chat_id для отправки")
+                    source_errors.append(
+                        f"{source.url}: нет Telegram/VK chat_id для отправки")
                     continue
 
                 for target_kind, target_chat_id in targets:
@@ -6333,13 +6626,15 @@ async def send_weekly_stats_to_sources(
         parser_context = await parser_browser.new_context(storage_state=storage_state)
 
         if tg_cfg is not None:
-            tg_timeout = aiohttp.ClientTimeout(total=tg_cfg.request_timeout_seconds)
+            tg_timeout = aiohttp.ClientTimeout(
+                total=tg_cfg.request_timeout_seconds)
             tg_session = aiohttp.ClientSession(
                 timeout=tg_timeout,
                 trust_env=tg_cfg.use_system_proxy,
             )
         if vk_cfg is not None:
-            vk_timeout = aiohttp.ClientTimeout(total=vk_cfg.request_timeout_seconds)
+            vk_timeout = aiohttp.ClientTimeout(
+                total=vk_cfg.request_timeout_seconds)
             vk_session = aiohttp.ClientSession(
                 timeout=vk_timeout,
                 trust_env=vk_cfg.use_system_proxy,
@@ -6360,7 +6655,8 @@ async def send_weekly_stats_to_sources(
                 message = build_weekly_stats_message(weekly_snapshot)
                 targets = iter_source_delivery_targets(source)
                 if not targets:
-                    source_errors.append(f"{source.url}: нет Telegram/VK chat_id для отправки")
+                    source_errors.append(
+                        f"{source.url}: нет Telegram/VK chat_id для отправки")
                     continue
 
                 for target_kind, target_chat_id in targets:
@@ -6448,13 +6744,15 @@ async def send_monthly_stats_to_sources(
         parser_context = await parser_browser.new_context(storage_state=storage_state)
 
         if tg_cfg is not None:
-            tg_timeout = aiohttp.ClientTimeout(total=tg_cfg.request_timeout_seconds)
+            tg_timeout = aiohttp.ClientTimeout(
+                total=tg_cfg.request_timeout_seconds)
             tg_session = aiohttp.ClientSession(
                 timeout=tg_timeout,
                 trust_env=tg_cfg.use_system_proxy,
             )
         if vk_cfg is not None:
-            vk_timeout = aiohttp.ClientTimeout(total=vk_cfg.request_timeout_seconds)
+            vk_timeout = aiohttp.ClientTimeout(
+                total=vk_cfg.request_timeout_seconds)
             vk_session = aiohttp.ClientSession(
                 timeout=vk_timeout,
                 trust_env=vk_cfg.use_system_proxy,
@@ -6475,7 +6773,8 @@ async def send_monthly_stats_to_sources(
                 message = build_monthly_stats_message(monthly_snapshot)
                 targets = iter_source_delivery_targets(source)
                 if not targets:
-                    source_errors.append(f"{source.url}: нет Telegram/VK chat_id для отправки")
+                    source_errors.append(
+                        f"{source.url}: нет Telegram/VK chat_id для отправки")
                     continue
 
                 for target_kind, target_chat_id in targets:
@@ -6558,7 +6857,8 @@ async def parser_worker_async(
                 state.parser_stop_event = None
             return
     else:
-        logger.info("Telegram доставка выключена глобально: %s=0", PARSER_DELIVERY_TELEGRAM_ENABLED_ENV)
+        logger.info("Telegram доставка выключена глобально: %s=0",
+                    PARSER_DELIVERY_TELEGRAM_ENABLED_ENV)
 
     vk_cfg: Optional[VkConfig] = None
     if vk_delivery_enabled:
@@ -6568,9 +6868,11 @@ async def parser_worker_async(
             vk_cfg = None
             logger.warning("VK конфигурация недоступна: %s", exc)
     else:
-        logger.info("VK доставка выключена глобально: %s=0", PARSER_DELIVERY_VK_ENABLED_ENV)
+        logger.info("VK доставка выключена глобально: %s=0",
+                    PARSER_DELIVERY_VK_ENABLED_ENV)
 
-    blogabet_requested = parse_bool_env(os.getenv("BLOGABET_ENABLED", "0"), default=False)
+    blogabet_requested = parse_bool_env(
+        os.getenv("BLOGABET_ENABLED", "0"), default=False)
     blogabet_cfg: Optional[BlogabetConfig] = None
     ocr_client: Optional[OcrSpaceClient] = None
     try:
@@ -6614,7 +6916,8 @@ async def parser_worker_async(
         blogabet_cfg = None
         ocr_client = None
         if blogabet_requested:
-            log_blogabet_error("BLOGABET_ENABLED=1, но Blogabet/OCR конфигурация недоступна: %s", exc)
+            log_blogabet_error(
+                "BLOGABET_ENABLED=1, но Blogabet/OCR конфигурация недоступна: %s", exc)
             with state.lock:
                 state.parser_error = (
                     f"{now_label()} | Blogabet/OCR конфигурация недоступна: {humanize_parser_error(exc)}"
@@ -6640,6 +6943,7 @@ async def parser_worker_async(
     source_bootstrapped: set[str] = set()
     delivery_tasks: set[asyncio.Task[None]] = set()
     settlement_tasks: set[asyncio.Task[None]] = set()
+    blogabet_retry_queue: list[BlogabetRetryItem] = []
     blogabet_publisher: Optional[BlogabetPublisher] = None
 
     try:
@@ -6651,16 +6955,19 @@ async def parser_worker_async(
             blogabet_publisher = BlogabetPublisher(blogabet_cfg, logger=logger)
 
         tg_timeout = aiohttp.ClientTimeout(
-            total=(tg_cfg.request_timeout_seconds if tg_cfg is not None else DEFAULT_TELEGRAM_REQUEST_TIMEOUT_SECONDS)
+            total=(
+                tg_cfg.request_timeout_seconds if tg_cfg is not None else DEFAULT_TELEGRAM_REQUEST_TIMEOUT_SECONDS)
         )
         async with aiohttp.ClientSession(
             timeout=tg_timeout,
-            trust_env=(tg_cfg.use_system_proxy if tg_cfg is not None else False),
+            trust_env=(
+                tg_cfg.use_system_proxy if tg_cfg is not None else False),
         ) as tg_session:
             vk_session: Optional[aiohttp.ClientSession] = None
             try:
                 if vk_cfg is not None:
-                    vk_timeout = aiohttp.ClientTimeout(total=vk_cfg.request_timeout_seconds)
+                    vk_timeout = aiohttp.ClientTimeout(
+                        total=vk_cfg.request_timeout_seconds)
                     vk_session = aiohttp.ClientSession(
                         timeout=vk_timeout,
                         trust_env=vk_cfg.use_system_proxy,
@@ -6669,15 +6976,65 @@ async def parser_worker_async(
                 while not stop_event.is_set():
                     cycle_started_at = time.monotonic()
                     interval_seconds = max(cfg.parser_interval_seconds, 10)
-                    parser_page_max_age_seconds = max(cfg.parser_page_max_age_seconds, 10)
+                    parser_page_max_age_seconds = max(
+                        cfg.parser_page_max_age_seconds, 10)
 
                     # Подчищаем завершившиеся delivery-задачи без блокировки цикла.
-                    delivery_tasks = {task for task in delivery_tasks if not task.done()}
-                    settlement_tasks = {task for task in settlement_tasks if not task.done()}
+                    delivery_tasks = {
+                        task for task in delivery_tasks if not task.done()}
+                    settlement_tasks = {
+                        task for task in settlement_tasks if not task.done()}
 
                     try:
                         if parser_context is None:
-                            raise RuntimeError("Сессия парсера не инициализирована")
+                            raise RuntimeError(
+                                "Сессия парсера не инициализирована")
+
+                        due_blogabet_retries = pop_due_blogabet_retries(
+                            blogabet_retry_queue,
+                            time.monotonic(),
+                        )
+                        for retry_item in due_blogabet_retries:
+                            with state.lock:
+                                if retry_item.delivery_key in state.pending_match_keys:
+                                    retry_item.next_retry_at_monotonic = (
+                                        time.monotonic() + 1.0
+                                    )
+                                    enqueue_blogabet_retry(
+                                        blogabet_retry_queue,
+                                        retry_item,
+                                    )
+                                    continue
+                                state.pending_match_keys.add(
+                                    retry_item.delivery_key)
+
+                            logger.info(
+                                "Запускаю повтор Blogabet публикации. delivery_key=%s attempt=%s match=%s - %s",
+                                retry_item.delivery_key,
+                                retry_item.attempt_no,
+                                retry_item.match.home_team,
+                                retry_item.match.away_team,
+                            )
+                            delivery_task = asyncio.create_task(
+                                deliver_match_notification(
+                                    tg_session,
+                                    tg_cfg,
+                                    vk_session,
+                                    vk_cfg,
+                                    blogabet_publisher,
+                                    blogabet_cfg,
+                                    ocr_client,
+                                    match_store,
+                                    retry_item.match,
+                                    retry_item.source,
+                                    "blogabet",
+                                    retry_item.target_chat_id,
+                                    retry_item.delivery_key,
+                                    blogabet_retry_queue,
+                                    retry_item.attempt_no,
+                                )
+                            )
+                            delivery_tasks.add(delivery_task)
 
                         with state.lock:
                             enabled_sources = [
@@ -6685,6 +7042,7 @@ async def parser_worker_async(
                                     source_id=source.source_id,
                                     url=source.url,
                                     chat_id=source.chat_id,
+                                    telegram_chat_ids=parser_source_telegram_chat_ids(source),
                                     vk_chat_ids=tuple(source.vk_chat_ids),
                                     enabled=True,
                                     telegram_enabled=source.telegram_enabled,
@@ -6694,13 +7052,15 @@ async def parser_worker_async(
                                 for source in state.parser_sources
                                 if source.enabled
                             ]
-                            interval_seconds = max(state.parser_interval_seconds, 10)
+                            interval_seconds = max(
+                                state.parser_interval_seconds, 10)
                             parser_page_max_age_seconds = max(
                                 state.parser_page_max_age_seconds,
                                 10,
                             )
 
-                        enabled_source_ids = {source.source_id for source in enabled_sources}
+                        enabled_source_ids = {
+                            source.source_id for source in enabled_sources}
                         for source_id in list(source_pages.keys()):
                             if source_id in enabled_source_ids:
                                 continue
@@ -6710,7 +7070,8 @@ async def parser_worker_async(
                             except Exception:  # noqa: BLE001
                                 pass
                             source_bootstrapped.discard(source_id)
-                            settlement_completed_fetch_last_at.pop(source_id, None)
+                            settlement_completed_fetch_last_at.pop(
+                                source_id, None)
 
                         if not enabled_sources:
                             with state.lock:
@@ -6729,13 +7090,16 @@ async def parser_worker_async(
                                 now_msk.weekday() == 0
                                 and now_msk.hour == cfg.weekly_stats_send_hour_msk
                             )
-                            weekly_start, weekly_end = previous_week_period(now_msk)
-                            weekly_period_key = weekly_stats_period_key(weekly_start, weekly_end)
+                            weekly_start, weekly_end = previous_week_period(
+                                now_msk)
+                            weekly_period_key = weekly_stats_period_key(
+                                weekly_start, weekly_end)
                             should_send_monthly_stats = (
                                 now_msk.day == 1
                                 and now_msk.hour == cfg.monthly_stats_send_hour_msk
                             )
-                            monthly_year, monthly_month = previous_month_period(now_msk)
+                            monthly_year, monthly_month = previous_month_period(
+                                now_msk)
                             monthly_period_key = monthly_stats_period_key(
                                 monthly_year,
                                 monthly_month,
@@ -6790,18 +7154,12 @@ async def parser_worker_async(
                                                     source,
                                                     include_blogabet=blogabet_publisher is not None,
                                                 ):
-                                                    if target_kind == "telegram":
-                                                        delivery_key = compose_delivery_key(
-                                                            source.source_id,
-                                                            match.unique_key,
-                                                        )
-                                                    else:
-                                                        delivery_key = compose_platform_delivery_key(
-                                                            source.source_id,
-                                                            match.unique_key,
-                                                            target_kind,
-                                                            target_chat_id,
-                                                        )
+                                                    delivery_key = compose_platform_delivery_key(
+                                                        source.source_id,
+                                                        match.unique_key,
+                                                        target_kind,
+                                                        target_chat_id,
+                                                    )
                                                     match_store.upsert_ignored_delivery(
                                                         source,
                                                         match,
@@ -6828,24 +7186,19 @@ async def parser_worker_async(
                                             source,
                                             include_blogabet=blogabet_publisher is not None,
                                         ):
-                                            if target_kind == "telegram":
-                                                delivery_key = compose_delivery_key(
-                                                    source.source_id,
-                                                    match.unique_key,
-                                                )
-                                            else:
-                                                delivery_key = compose_platform_delivery_key(
-                                                    source.source_id,
-                                                    match.unique_key,
-                                                    target_kind,
-                                                    target_chat_id,
-                                                )
+                                            delivery_key = compose_platform_delivery_key(
+                                                source.source_id,
+                                                match.unique_key,
+                                                target_kind,
+                                                target_chat_id,
+                                            )
                                             with state.lock:
                                                 if delivery_key in state.pending_match_keys:
                                                     continue
 
                                             try:
-                                                already_delivered = match_store.delivery_exists(delivery_key)
+                                                already_delivered = match_store.delivery_exists(
+                                                    delivery_key)
                                             except Exception as storage_exc:  # noqa: BLE001
                                                 source_errors.append(
                                                     f"{source.url}: ошибка чтения БД матчей ({humanize_parser_error(storage_exc)})"
@@ -6858,7 +7211,8 @@ async def parser_worker_async(
                                             with state.lock:
                                                 if delivery_key in state.pending_match_keys:
                                                     continue
-                                                state.pending_match_keys.add(delivery_key)
+                                                state.pending_match_keys.add(
+                                                    delivery_key)
 
                                             delivery_task = asyncio.create_task(
                                                 deliver_match_notification(
@@ -6875,11 +7229,15 @@ async def parser_worker_async(
                                                     target_kind,
                                                     target_chat_id,
                                                     delivery_key,
+                                                    blogabet_retry_queue
+                                                    if target_kind == "blogabet"
+                                                    else None,
                                                 )
                                             )
                                             delivery_tasks.add(delivery_task)
 
-                                source_runtime = source_pages.get(source.source_id)
+                                source_runtime = source_pages.get(
+                                    source.source_id)
                                 if source_runtime is not None:
                                     try:
                                         settled_updates_scheduled = await schedule_settlement_updates_for_source(
@@ -6907,7 +7265,8 @@ async def parser_worker_async(
 
                                 if should_send_daily_stats:
                                     if source_runtime is not None:
-                                        daily_delivery_targets: list[tuple[str, str, str]] = []
+                                        daily_delivery_targets: list[tuple[str, str, str]] = [
+                                        ]
                                         with state.lock:
                                             for target_kind, target_chat_id in iter_source_delivery_targets(source):
                                                 target_key = build_stats_target_key(
@@ -6917,7 +7276,8 @@ async def parser_worker_async(
                                                     target_chat_id,
                                                 )
                                                 already_sent_for_date = (
-                                                    state.daily_stats_sent_by_source.get(target_key)
+                                                    state.daily_stats_sent_by_source.get(
+                                                        target_key)
                                                     == daily_stats_date
                                                 )
                                                 if (
@@ -6925,9 +7285,11 @@ async def parser_worker_async(
                                                     or target_key in state.daily_stats_inflight_sources
                                                 ):
                                                     continue
-                                                state.daily_stats_inflight_sources.add(target_key)
+                                                state.daily_stats_inflight_sources.add(
+                                                    target_key)
                                                 daily_delivery_targets.append(
-                                                    (target_kind, target_chat_id, target_key)
+                                                    (target_kind,
+                                                     target_chat_id, target_key)
                                                 )
                                         if daily_delivery_targets:
                                             await deliver_daily_stats_notification(
@@ -6944,7 +7306,8 @@ async def parser_worker_async(
 
                                 if should_send_weekly_stats:
                                     if source_runtime is not None:
-                                        weekly_delivery_targets: list[tuple[str, str, str]] = []
+                                        weekly_delivery_targets: list[tuple[str, str, str]] = [
+                                        ]
                                         with state.lock:
                                             for target_kind, target_chat_id in iter_source_delivery_targets(source):
                                                 target_key = build_stats_target_key(
@@ -6954,7 +7317,8 @@ async def parser_worker_async(
                                                     target_chat_id,
                                                 )
                                                 already_sent_for_period = (
-                                                    state.weekly_stats_sent_by_source.get(target_key)
+                                                    state.weekly_stats_sent_by_source.get(
+                                                        target_key)
                                                     == weekly_period_key
                                                 )
                                                 if (
@@ -6962,9 +7326,11 @@ async def parser_worker_async(
                                                     or target_key in state.weekly_stats_inflight_sources
                                                 ):
                                                     continue
-                                                state.weekly_stats_inflight_sources.add(target_key)
+                                                state.weekly_stats_inflight_sources.add(
+                                                    target_key)
                                                 weekly_delivery_targets.append(
-                                                    (target_kind, target_chat_id, target_key)
+                                                    (target_kind,
+                                                     target_chat_id, target_key)
                                                 )
                                         if weekly_delivery_targets:
                                             await deliver_weekly_stats_notification(
@@ -6983,7 +7349,8 @@ async def parser_worker_async(
 
                                 if should_send_monthly_stats:
                                     if source_runtime is not None:
-                                        monthly_delivery_targets: list[tuple[str, str, str]] = []
+                                        monthly_delivery_targets: list[tuple[str, str, str]] = [
+                                        ]
                                         with state.lock:
                                             for target_kind, target_chat_id in iter_source_delivery_targets(source):
                                                 target_key = build_stats_target_key(
@@ -6993,7 +7360,8 @@ async def parser_worker_async(
                                                     target_chat_id,
                                                 )
                                                 already_sent_for_period = (
-                                                    state.monthly_stats_sent_by_source.get(target_key)
+                                                    state.monthly_stats_sent_by_source.get(
+                                                        target_key)
                                                     == monthly_period_key
                                                 )
                                                 if (
@@ -7001,9 +7369,11 @@ async def parser_worker_async(
                                                     or target_key in state.monthly_stats_inflight_sources
                                                 ):
                                                     continue
-                                                state.monthly_stats_inflight_sources.add(target_key)
+                                                state.monthly_stats_inflight_sources.add(
+                                                    target_key)
                                                 monthly_delivery_targets.append(
-                                                    (target_kind, target_chat_id, target_key)
+                                                    (target_kind,
+                                                     target_chat_id, target_key)
                                                 )
                                         if monthly_delivery_targets:
                                             await deliver_monthly_stats_notification(
@@ -7033,6 +7403,13 @@ async def parser_worker_async(
 
                     elapsed = time.monotonic() - cycle_started_at
                     sleep_seconds = max(0.0, interval_seconds - elapsed)
+                    if blogabet_retry_queue:
+                        next_retry_sleep = max(
+                            0.0,
+                            blogabet_retry_queue[0].next_retry_at_monotonic
+                            - time.monotonic(),
+                        )
+                        sleep_seconds = min(sleep_seconds, next_retry_sleep)
                     if sleep_seconds <= 0:
                         continue
                     if await asyncio.to_thread(stop_event.wait, sleep_seconds):
@@ -7089,6 +7466,7 @@ async def parser_worker_async(
             if state.parser_thread is threading.current_thread():
                 state.parser_thread = None
             state.parser_running = False
+            state.blogabet_retry_queue_size = 0
 
         logger.info("Фоновый парсер остановлен")
 
@@ -7117,13 +7495,16 @@ def start_parser_thread(cfg: TargetConfig, storage_state: dict[str, Any]) -> Non
 
     with state.lock:
         if state.parser_interval_seconds < 10:
-            state.parser_interval_seconds = max(cfg.parser_interval_seconds, 10)
+            state.parser_interval_seconds = max(
+                cfg.parser_interval_seconds, 10)
         state.parser_interval_initialized = True
         if state.parser_page_max_age_seconds < 10:
-            state.parser_page_max_age_seconds = max(cfg.parser_page_max_age_seconds, 10)
+            state.parser_page_max_age_seconds = max(
+                cfg.parser_page_max_age_seconds, 10)
         state.parser_page_max_age_initialized = True
         state.pending_match_keys = set()
         state.pending_settlement_keys = set()
+        state.blogabet_retry_queue_size = 0
         state.parser_last_check_at = ""
         state.parser_last_sent_at = ""
         state.parser_last_match_title = ""
@@ -7774,9 +8155,12 @@ TEMPLATE = """
           <article class="tile">
             <h3>Вход в аккаунт</h3>
             <form method="post" action="{{ url_for('start_login') }}">
-              <input name="password" type="password" placeholder="Пароль" required />
+              <input name="password" type="password" placeholder="Пароль" {% if not target_password_saved %}required{% endif %} />
               <button type="submit" {% if not can_start_login %}disabled{% endif %}>Начать вход</button>
             </form>
+            <div class="hint">
+              {% if target_password_saved %}Пароль сохранён в .env — можно оставить поле пустым для входа с ним.{% else %}Последний успешный пароль сохранится в .env автоматически.{% endif %}
+            </div>
             <form method="post" action="{{ url_for('reset') }}">
               <button class="danger" type="submit" {% if not can_logout %}disabled{% endif %}>Выйти из аккаунта</button>
             </form>
@@ -7887,11 +8271,11 @@ TEMPLATE = """
           <h3>Добавить ссылку</h3>
           <form method="post" action="{{ url_for('add_parser_source_route') }}">
             <input name="source_url" type="url" placeholder="https://..." required />
-            <input name="source_chat_id" type="text" placeholder="Telegram chat_id: -100... или @channel" required />
+            <textarea name="source_chat_id" placeholder="Telegram chat_id: -100..., user_id или @channel. Можно несколько: по одному в строке, через запятую или ;" required></textarea>
             <textarea name="source_vk_chat_ids" placeholder="VK chat_id (peer_id): по одному в строке, через запятую или ;"></textarea>
             <button class="secondary" type="submit" {% if not can_manage_parser %}disabled{% endif %}>Добавить ссылку</button>
           </form>
-          <div class="hint">VK-поля можно оставить пустыми. Поддерживается ввод через новую строку, запятую или ;</div>
+          <div class="hint">Telegram принимает ID каналов, @username и ID личных чатов пользователей, которые уже открыли диалог с ботом. VK-поля можно оставить пустыми.</div>
         </article>
 
         <div class="source-list">
@@ -7900,7 +8284,7 @@ TEMPLATE = """
             <div class="source-url">{{ source.url }}</div>
             <form method="post" action="{{ url_for('update_parser_source_chat_route') }}" class="source-chat-form">
               <input type="hidden" name="source_id" value="{{ source.source_id }}" />
-              <input name="source_chat_id" type="text" value="{{ source.chat_id }}" placeholder="-100... или @channel" required />
+              <textarea name="source_chat_id" placeholder="Telegram chat_id">{{ source.telegram_chat_ids|join('\n') }}</textarea>
               <button class="secondary mini" type="submit" {% if not can_manage_parser %}disabled{% endif %}>Сохранить Telegram chat_id</button>
             </form>
             <form method="post" action="{{ url_for('update_parser_source_vk_chat_route') }}" class="source-chat-form">
@@ -8024,6 +8408,12 @@ TEMPLATE = """
             <div class="hint">Включено: {{ 'Да' if blogabet_enabled else 'Нет' }}</div>
             <div class="hint">Headless: {{ 'Да' if blogabet_headless else 'Нет' }}</div>
             <div class="hint">Stake по умолчанию: {{ blogabet_default_stake }}</div>
+            <div class="hint">Очередь повторов: {{ blogabet_retry_queue_size }}</div>
+            <form method="post" action="{{ url_for('update_blogabet_retry_delay') }}">
+              <input name="blogabet_retry_delay_seconds" type="number" min="10" step="1" value="{{ blogabet_retry_delay_seconds }}" required />
+              <button class="secondary" type="submit" {% if not can_manage_parser %}disabled{% endif %}>Сохранить retry</button>
+            </form>
+            <div class="hint">Через сколько секунд повторять failed-публикацию Blogabet. По умолчанию 180 сек.</div>
             <div class="hint">Storage state: <code>{{ blogabet_storage_state_path }}</code></div>
             <div class="hint">Файл state: {{ 'найден' if blogabet_storage_state_exists else 'не найден' }}</div>
             <form method="post" action="{{ url_for('blogabet_login_route') }}">
@@ -8065,6 +8455,10 @@ TEMPLATE = """
                 <div class="source-url">{{ alias.source }}</div>
                 <div class="chip-row">
                   <span class="chip">→ {{ alias.target }}</span>
+                  <form method="post" action="{{ url_for('blogabet_alias_delete_route') }}" style="display: inline;">
+                    <input type="hidden" name="alias_source_tournament" value="{{ alias.source }}" />
+                    <button class="danger mini" type="submit" onclick="return confirm('Удалить алиас {{ alias.source }} -> {{ alias.target }}?')">Удалить</button>
+                  </form>
                 </div>
               </div>
               {% endfor %}
@@ -8269,10 +8663,12 @@ def index():
     )
     blogabet_storage_state_exists = Path(blogabet_storage_state_path).exists()
     blogabet_league_aliases_path = str(resolve_blogabet_league_aliases_path())
-    blogabet_league_aliases_exists = Path(blogabet_league_aliases_path).exists()
+    blogabet_league_aliases_exists = Path(
+        blogabet_league_aliases_path).exists()
     blogabet_league_aliases_updated_at = ""
     blogabet_league_aliases: list[dict[str, str]] = []
     blogabet_league_aliases_count = 0
+    default_blogabet_retry_delay_seconds = DEFAULT_BLOGABET_RETRY_DELAY_SECONDS
     default_interval = DEFAULT_PARSER_INTERVAL_SECONDS
     default_parser_page_max_age_seconds = DEFAULT_PARSER_PAGE_MAX_AGE_SECONDS
     default_parser_send_existing_on_start = True
@@ -8302,14 +8698,25 @@ def index():
         config_error = str(exc)
 
     try:
+        default_blogabet_retry_delay_seconds = load_blogabet_retry_delay_seconds()
+        ensure_blogabet_retry_runtime_defaults()
+    except Exception as exc:  # noqa: BLE001
+        if config_error:
+            config_error = f"{config_error} | Blogabet retry: {exc}"
+        else:
+            config_error = f"Blogabet retry: {exc}"
+
+    try:
         blogabet_cfg = load_blogabet_config()
         blogabet_enabled = blogabet_cfg.enabled
         blogabet_headless = blogabet_cfg.headless
         blogabet_default_stake = blogabet_cfg.default_stake
         blogabet_storage_state_path = blogabet_cfg.storage_state_path
-        blogabet_storage_state_exists = Path(blogabet_storage_state_path).exists()
+        blogabet_storage_state_exists = Path(
+            blogabet_storage_state_path).exists()
         blogabet_league_aliases_path = blogabet_cfg.league_aliases_path
-        blogabet_league_aliases_exists = Path(blogabet_league_aliases_path).exists()
+        blogabet_league_aliases_exists = Path(
+            blogabet_league_aliases_path).exists()
     except Exception as exc:  # noqa: BLE001
         if config_error:
             config_error = f"{config_error} | Blogabet: {exc}"
@@ -8317,7 +8724,8 @@ def index():
             config_error = f"Blogabet: {exc}"
 
     try:
-        aliases_payload = load_blogabet_league_aliases_payload(Path(blogabet_league_aliases_path))
+        aliases_payload = load_blogabet_league_aliases_payload(
+            Path(blogabet_league_aliases_path))
         aliases_map = aliases_payload.get("aliases", {})
         if not isinstance(aliases_map, dict):
             aliases_map = {}
@@ -8331,7 +8739,8 @@ def index():
             }
             for source, target in aliases_map.items()
         ]
-        blogabet_league_aliases.sort(key=lambda item: normalize_text(item["source"]).lower())
+        blogabet_league_aliases.sort(
+            key=lambda item: normalize_text(item["source"]).lower())
         blogabet_league_aliases_count = len(blogabet_league_aliases)
     except Exception as exc:  # noqa: BLE001
         if config_error:
@@ -8361,6 +8770,11 @@ def index():
             state.parser_page_max_age_seconds,
             10,
         ) if state.parser_page_max_age_initialized else max(default_parser_page_max_age_seconds, 10)
+        blogabet_retry_delay_seconds = max(
+            state.blogabet_retry_delay_seconds,
+            10,
+        ) if state.blogabet_retry_delay_initialized else max(default_blogabet_retry_delay_seconds, 10)
+        blogabet_retry_queue_size = state.blogabet_retry_queue_size
         parser_sources = list(state.parser_sources)
         enabled_sources = sum(1 for source in parser_sources if source.enabled)
         total_sources = len(parser_sources)
@@ -8420,6 +8834,7 @@ def index():
             message_id=state.last_message_id,
             parser_sources=parser_sources,
             telegram_token_masked=telegram_token_masked,
+            target_password_saved=bool((os.getenv("TARGET_LOGIN_PASSWORD") or "").strip()),
             vk_token_masked=vk_token_masked,
             vk_chat_lookup_results=vk_chat_lookup_results,
             vk_chat_lookup_loaded=vk_chat_lookup_loaded,
@@ -8435,6 +8850,8 @@ def index():
             blogabet_league_aliases_updated_at=blogabet_league_aliases_updated_at,
             blogabet_league_aliases=blogabet_league_aliases,
             blogabet_league_aliases_count=blogabet_league_aliases_count,
+            blogabet_retry_delay_seconds=blogabet_retry_delay_seconds,
+            blogabet_retry_queue_size=blogabet_retry_queue_size,
             blogabet_test_log=blogabet_test_log,
             blogabet_test_pick_url=blogabet_test_pick_url,
             blogabet_test_screenshot_path=blogabet_test_screenshot_path,
@@ -8462,19 +8879,24 @@ def index():
 
 @app.post("/start-login")
 def start_login():
-    password = request.form.get("password", "").strip()
+    form_password = request.form.get("password", "").strip()
 
     with state.lock:
         state.error = ""
         state.info = ""
 
-    if not password:
-        with state.lock:
-            state.error = "Нужно передать пароль"
-        return redirect(url_for("index"))
-
     try:
         cfg = load_target_config()
+
+        # Если поле пароля пустое — берём последний сохранённый в .env.
+        password = form_password or (cfg.login_password or "").strip()
+        if not password:
+            with state.lock:
+                state.error = "Нужно передать пароль"
+            return redirect(url_for("index"))
+
+        with state.lock:
+            state.pending_login_password = password
 
         state.stop_parser()
         state.clear_runtime()
@@ -8535,6 +8957,9 @@ def start_login():
         with state.lock:
             state.step = "ready"
             state.auth_storage_state = auth_storage_state
+            state.pending_login_password = ""
+        # Вход без 2FA подтверждён — сохраняем рабочий пароль.
+        save_target_login_password(password)
         state.clear_runtime()
     except Exception as exc:  # noqa: BLE001
         with state.lock:
@@ -8589,6 +9014,10 @@ def submit_code():
         with state.lock:
             state.step = "ready"
             state.auth_storage_state = auth_storage_state
+            pending_password = state.pending_login_password
+            state.pending_login_password = ""
+        # 2FA подтверждён — сохраняем рабочий пароль, введённый на шаге логина.
+        save_target_login_password(pending_password)
         state.clear_runtime()
     except Exception as exc:  # noqa: BLE001
         with state.lock:
@@ -8606,6 +9035,8 @@ def start_parser():
     try:
         cfg = load_target_config()
         ensure_parser_runtime_defaults(cfg)
+        if parse_bool_env(os.getenv("BLOGABET_ENABLED", "0"), default=False):
+            ensure_blogabet_retry_runtime_defaults()
         telegram_delivery_enabled = is_telegram_delivery_enabled()
         vk_delivery_enabled = is_vk_delivery_enabled()
 
@@ -8619,18 +9050,24 @@ def start_parser():
             raise RuntimeError("Сначала выполни вход и подтверди код")
 
         with state.lock:
-            enabled_sources = [source for source in state.parser_sources if source.enabled]
+            enabled_sources = [
+                source for source in state.parser_sources if source.enabled]
         if not enabled_sources:
             raise RuntimeError("Нет включенных ссылок для парсинга")
         sources_with_invalid_chat: list[str] = []
         sources_with_invalid_vk_chat: list[str] = []
         requires_vk_delivery = False
         for source in enabled_sources:
-            if telegram_delivery_enabled:
-                try:
-                    validate_chat_id(source.chat_id)
-                except Exception:  # noqa: BLE001
+            if telegram_delivery_enabled and source.telegram_enabled:
+                telegram_chat_ids = parser_source_telegram_chat_ids(source)
+                if not telegram_chat_ids:
                     sources_with_invalid_chat.append(source.url)
+                for chat_id in telegram_chat_ids:
+                    try:
+                        validate_chat_id(chat_id)
+                    except Exception:  # noqa: BLE001
+                        sources_with_invalid_chat.append(source.url)
+                        break
             if vk_delivery_enabled and source.vk_chat_ids:
                 requires_vk_delivery = True
             if vk_delivery_enabled:
@@ -8656,7 +9093,8 @@ def start_parser():
         with state.lock:
             storage_state = state.auth_storage_state
         if storage_state is None:
-            raise RuntimeError("Сессия авторизации недоступна. Выполни вход заново.")
+            raise RuntimeError(
+                "Сессия авторизации недоступна. Выполни вход заново.")
 
         start_parser_thread(cfg, storage_state)
         with state.lock:
@@ -8696,7 +9134,8 @@ def add_parser_source_route():
         if not is_ready:
             raise RuntimeError("Сначала выполни вход и подтверди код")
         if parser_running:
-            raise RuntimeError("Останови парсер перед изменением режима доставки Telegram")
+            raise RuntimeError(
+                "Останови парсер перед изменением режима доставки Telegram")
 
         is_added, source = add_parser_source(
             source_url,
@@ -8707,12 +9146,14 @@ def add_parser_source_route():
         with state.lock:
             if is_added:
                 state.info = (
-                    f"Ссылка добавлена: {source.url} -> TG {source.chat_id}, "
+                    f"Ссылка добавлена: {source.url} -> TG "
+                    f"{len(parser_source_telegram_chat_ids(source))} чат(ов), "
                     f"VK {len(source.vk_chat_ids)} чат(ов)"
                 )
             else:
                 state.info = (
-                    f"Ссылка обновлена: {source.url} -> TG {source.chat_id}, "
+                    f"Ссылка обновлена: {source.url} -> TG "
+                    f"{len(parser_source_telegram_chat_ids(source))} чат(ов), "
                     f"VK {len(source.vk_chat_ids)} чат(ов)"
                 )
     except Exception as exc:  # noqa: BLE001
@@ -8745,7 +9186,10 @@ def update_parser_source_chat_route():
 
         source = update_parser_source_chat_id(source_id, source_chat_id)
         with state.lock:
-            state.info = f"Telegram chat_id обновлён: {source.url} -> {source.chat_id}"
+            state.info = (
+                f"Telegram chat_id обновлены: {source.url} -> "
+                f"{len(parser_source_telegram_chat_ids(source))} чат(ов)"
+            )
     except Exception as exc:  # noqa: BLE001
         with state.lock:
             state.error = f"Не удалось обновить Telegram chat_id: {exc}"
@@ -8777,7 +9221,8 @@ def update_parser_source_vk_chat_route():
         if not is_ready:
             raise RuntimeError("Сначала выполни вход и подтверди код")
 
-        source = update_parser_source_vk_chat_ids(source_id, source_vk_chat_ids)
+        source = update_parser_source_vk_chat_ids(
+            source_id, source_vk_chat_ids)
         with state.lock:
             state.info = (
                 f"VK chat_id обновлён: {source.url} -> "
@@ -8982,7 +9427,8 @@ def update_parser_page_max_age():
         state.error = ""
         state.info = ""
 
-    page_max_age_raw = request.form.get("parser_page_max_age_seconds", "").strip()
+    page_max_age_raw = request.form.get(
+        "parser_page_max_age_seconds", "").strip()
 
     try:
         with state.lock:
@@ -8997,7 +9443,8 @@ def update_parser_page_max_age():
             minimum_seconds=10,
         )
 
-        upsert_env_value("PARSER_PAGE_MAX_AGE_SECONDS", str(page_max_age_seconds))
+        upsert_env_value("PARSER_PAGE_MAX_AGE_SECONDS",
+                         str(page_max_age_seconds))
         os.environ["PARSER_PAGE_MAX_AGE_SECONDS"] = str(page_max_age_seconds)
 
         with state.lock:
@@ -9017,13 +9464,58 @@ def update_parser_page_max_age():
     return redirect(url_for("index"))
 
 
+@app.post("/update-blogabet-retry-delay")
+def update_blogabet_retry_delay():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    retry_delay_raw = request.form.get(
+        "blogabet_retry_delay_seconds", "").strip()
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+
+        retry_delay_seconds = parse_min_seconds_value(
+            retry_delay_raw,
+            field_label="Интервал повтора Blogabet",
+            minimum_seconds=10,
+        )
+
+        upsert_env_value(BLOGABET_RETRY_DELAY_SECONDS_ENV,
+                         str(retry_delay_seconds))
+        os.environ[BLOGABET_RETRY_DELAY_SECONDS_ENV] = str(
+            retry_delay_seconds)
+
+        with state.lock:
+            state.blogabet_retry_delay_seconds = retry_delay_seconds
+            state.blogabet_retry_delay_initialized = True
+            if state.parser_running:
+                state.info = (
+                    f"Интервал повтора Blogabet обновлен: {retry_delay_seconds} сек. "
+                    "Новые failed-публикации будут ставиться в очередь с этим интервалом."
+                )
+            else:
+                state.info = f"Интервал повтора Blogabet обновлен: {retry_delay_seconds} сек"
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось обновить интервал повтора Blogabet: {exc}"
+
+    return redirect(url_for("index"))
+
+
 @app.post("/update-parser-send-existing")
 def update_parser_send_existing_mode():
     with state.lock:
         state.error = ""
         state.info = ""
 
-    raw_value = normalize_text(request.form.get("parser_send_existing_on_start", ""))
+    raw_value = normalize_text(request.form.get(
+        "parser_send_existing_on_start", ""))
 
     try:
         with state.lock:
@@ -9033,7 +9525,8 @@ def update_parser_send_existing_mode():
         if not is_ready:
             raise RuntimeError("Сначала выполни вход и подтверди код")
         if parser_running:
-            raise RuntimeError("Останови парсер перед изменением режима доставки Telegram")
+            raise RuntimeError(
+                "Останови парсер перед изменением режима доставки Telegram")
 
         if raw_value not in {"0", "1"}:
             raise ValueError("Нужно выбрать режим 0 или 1")
@@ -9068,7 +9561,8 @@ def update_parser_delivery_telegram_mode():
         state.error = ""
         state.info = ""
 
-    raw_value = normalize_text(request.form.get("parser_delivery_telegram_enabled", ""))
+    raw_value = normalize_text(request.form.get(
+        "parser_delivery_telegram_enabled", ""))
 
     try:
         with state.lock:
@@ -9078,7 +9572,8 @@ def update_parser_delivery_telegram_mode():
         if not is_ready:
             raise RuntimeError("Сначала выполни вход и подтверди код")
         if parser_running:
-            raise RuntimeError("Останови парсер перед изменением режима доставки Telegram")
+            raise RuntimeError(
+                "Останови парсер перед изменением режима доставки Telegram")
 
         if raw_value not in {"0", "1"}:
             raise ValueError("Нужно выбрать режим 0 или 1")
@@ -9107,7 +9602,8 @@ def update_parser_delivery_vk_mode():
         state.error = ""
         state.info = ""
 
-    raw_value = normalize_text(request.form.get("parser_delivery_vk_enabled", ""))
+    raw_value = normalize_text(request.form.get(
+        "parser_delivery_vk_enabled", ""))
 
     try:
         with state.lock:
@@ -9117,7 +9613,8 @@ def update_parser_delivery_vk_mode():
         if not is_ready:
             raise RuntimeError("Сначала выполни вход и подтверди код")
         if parser_running:
-            raise RuntimeError("Останови парсер перед изменением режима доставки VK")
+            raise RuntimeError(
+                "Останови парсер перед изменением режима доставки VK")
 
         if raw_value not in {"0", "1"}:
             raise ValueError("Нужно выбрать режим 0 или 1")
@@ -9153,7 +9650,8 @@ def analyze_stats_delivery_sources(sources: list[ParserSource]) -> tuple[bool, b
     telegram_delivery_enabled = is_telegram_delivery_enabled()
     vk_delivery_enabled = is_vk_delivery_enabled()
     if not telegram_delivery_enabled and not vk_delivery_enabled:
-        raise RuntimeError("Отправка в Telegram и VK отключена в настройках парсера")
+        raise RuntimeError(
+            "Отправка в Telegram и VK отключена в настройках парсера")
 
     invalid_tg_sources: list[str] = []
     invalid_vk_sources: list[str] = []
@@ -9171,14 +9669,15 @@ def analyze_stats_delivery_sources(sources: list[ParserSource]) -> tuple[bool, b
         has_sources_with_delivery_enabled = True
         source_has_target = False
 
-        normalized_tg_chat_id = normalize_chat_id(source.chat_id)
-        if source_telegram_enabled and normalized_tg_chat_id:
-            try:
-                validate_chat_id(normalized_tg_chat_id)
-                has_telegram_targets = True
-                source_has_target = True
-            except Exception:  # noqa: BLE001
-                invalid_tg_sources.append(source.url)
+        if source_telegram_enabled:
+            for raw_tg_chat_id in parser_source_telegram_chat_ids(source):
+                try:
+                    validate_chat_id(raw_tg_chat_id)
+                    has_telegram_targets = True
+                    source_has_target = True
+                except Exception:  # noqa: BLE001
+                    invalid_tg_sources.append(source.url)
+                    break
 
         if source_vk_enabled:
             for raw_vk_chat_id in source.vk_chat_ids:
@@ -9253,6 +9752,7 @@ def send_daily_stats_test_route():
                     source_id=source.source_id,
                     url=source.url,
                     chat_id=source.chat_id,
+                    telegram_chat_ids=parser_source_telegram_chat_ids(source),
                     vk_chat_ids=tuple(source.vk_chat_ids),
                     enabled=True,
                     telegram_enabled=source.telegram_enabled,
@@ -9265,11 +9765,13 @@ def send_daily_stats_test_route():
             storage_state = state.auth_storage_state
 
         if storage_state is None:
-            raise RuntimeError("Сессия авторизации недоступна. Выполни вход заново.")
+            raise RuntimeError(
+                "Сессия авторизации недоступна. Выполни вход заново.")
         if not enabled_sources:
             raise RuntimeError("Нет включенных ссылок для отправки")
 
-        has_telegram_targets, has_vk_targets = analyze_stats_delivery_sources(enabled_sources)
+        has_telegram_targets, has_vk_targets = analyze_stats_delivery_sources(
+            enabled_sources)
         if has_telegram_targets:
             tg_cfg = load_telegram_config()
         if has_vk_targets:
@@ -9288,7 +9790,8 @@ def send_daily_stats_test_route():
 
         if not sent_targets:
             joined = " | ".join(source_errors)
-            raise RuntimeError(f"Не удалось отправить статистику ни по одной ссылке: {joined}")
+            raise RuntimeError(
+                f"Не удалось отправить статистику ни по одной ссылке: {joined}")
 
         with state.lock:
             state.last_message_id = message_id
@@ -9298,7 +9801,8 @@ def send_daily_stats_test_route():
                 f"Суточная статистика за {stats_date} отправлена в {len(sent_targets)} канал(ов)."
             )
             if source_errors:
-                state.error = "Часть каналов не отправлена: " + " | ".join(source_errors)
+                state.error = "Часть каналов не отправлена: " + \
+                    " | ".join(source_errors)
     except Exception as exc:  # noqa: BLE001
         with state.lock:
             state.error = f"Не удалось отправить суточную статистику: {exc}"
@@ -9332,6 +9836,7 @@ def send_weekly_stats_test_route():
                     source_id=source.source_id,
                     url=source.url,
                     chat_id=source.chat_id,
+                    telegram_chat_ids=parser_source_telegram_chat_ids(source),
                     vk_chat_ids=tuple(source.vk_chat_ids),
                     enabled=True,
                     telegram_enabled=source.telegram_enabled,
@@ -9344,11 +9849,13 @@ def send_weekly_stats_test_route():
             storage_state = state.auth_storage_state
 
         if storage_state is None:
-            raise RuntimeError("Сессия авторизации недоступна. Выполни вход заново.")
+            raise RuntimeError(
+                "Сессия авторизации недоступна. Выполни вход заново.")
         if not enabled_sources:
             raise RuntimeError("Нет включенных ссылок для отправки")
 
-        has_telegram_targets, has_vk_targets = analyze_stats_delivery_sources(enabled_sources)
+        has_telegram_targets, has_vk_targets = analyze_stats_delivery_sources(
+            enabled_sources)
         if has_telegram_targets:
             tg_cfg = load_telegram_config()
         if has_vk_targets:
@@ -9368,7 +9875,8 @@ def send_weekly_stats_test_route():
 
         if not sent_targets:
             joined = " | ".join(source_errors)
-            raise RuntimeError(f"Не удалось отправить статистику ни по одной ссылке: {joined}")
+            raise RuntimeError(
+                f"Не удалось отправить статистику ни по одной ссылке: {joined}")
 
         with state.lock:
             state.last_message_id = message_id
@@ -9379,7 +9887,8 @@ def send_weekly_stats_test_route():
                 f"{len(sent_targets)} канал(ам)."
             )
             if source_errors:
-                state.error = "Часть каналов не отправлена: " + " | ".join(source_errors)
+                state.error = "Часть каналов не отправлена: " + \
+                    " | ".join(source_errors)
     except Exception as exc:  # noqa: BLE001
         with state.lock:
             state.error = f"Не удалось отправить недельную статистику: {exc}"
@@ -9413,6 +9922,7 @@ def send_monthly_stats_test_route():
                     source_id=source.source_id,
                     url=source.url,
                     chat_id=source.chat_id,
+                    telegram_chat_ids=parser_source_telegram_chat_ids(source),
                     vk_chat_ids=tuple(source.vk_chat_ids),
                     enabled=True,
                     telegram_enabled=source.telegram_enabled,
@@ -9425,11 +9935,13 @@ def send_monthly_stats_test_route():
             storage_state = state.auth_storage_state
 
         if storage_state is None:
-            raise RuntimeError("Сессия авторизации недоступна. Выполни вход заново.")
+            raise RuntimeError(
+                "Сессия авторизации недоступна. Выполни вход заново.")
         if not enabled_sources:
             raise RuntimeError("Нет включенных ссылок для отправки")
 
-        has_telegram_targets, has_vk_targets = analyze_stats_delivery_sources(enabled_sources)
+        has_telegram_targets, has_vk_targets = analyze_stats_delivery_sources(
+            enabled_sources)
         if has_telegram_targets:
             tg_cfg = load_telegram_config()
         if has_vk_targets:
@@ -9449,7 +9961,8 @@ def send_monthly_stats_test_route():
 
         if not sent_targets:
             joined = " | ".join(source_errors)
-            raise RuntimeError(f"Не удалось отправить статистику ни по одной ссылке: {joined}")
+            raise RuntimeError(
+                f"Не удалось отправить статистику ни по одной ссылке: {joined}")
 
         with state.lock:
             state.last_message_id = message_id
@@ -9460,7 +9973,8 @@ def send_monthly_stats_test_route():
                 f"{len(sent_targets)} канал(ам)."
             )
             if source_errors:
-                state.error = "Часть каналов не отправлена: " + " | ".join(source_errors)
+                state.error = "Часть каналов не отправлена: " + \
+                    " | ".join(source_errors)
     except Exception as exc:  # noqa: BLE001
         with state.lock:
             state.error = f"Не удалось отправить месячную статистику: {exc}"
@@ -9478,6 +9992,7 @@ def collect_unique_enabled_chat_ids() -> list[str]:
                 source_id=source.source_id,
                 url=source.url,
                 chat_id=source.chat_id,
+                telegram_chat_ids=parser_source_telegram_chat_ids(source),
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
                 telegram_enabled=source.telegram_enabled,
@@ -9485,7 +10000,7 @@ def collect_unique_enabled_chat_ids() -> list[str]:
                 blogabet_enabled=source.blogabet_enabled,
             )
             for source in state.parser_sources
-            if source.enabled and source.telegram_enabled and normalize_chat_id(source.chat_id)
+            if source.enabled and source.telegram_enabled and parser_source_telegram_chat_ids(source)
         ]
 
     if not raw_sources_with_chat:
@@ -9494,11 +10009,12 @@ def collect_unique_enabled_chat_ids() -> list[str]:
     unique_chat_ids: list[str] = []
     seen_chat_ids: set[str] = set()
     for source in raw_sources_with_chat:
-        target_chat_id = validate_chat_id(source.chat_id)
-        if target_chat_id in seen_chat_ids:
-            continue
-        unique_chat_ids.append(target_chat_id)
-        seen_chat_ids.add(target_chat_id)
+        for chat_id in parser_source_telegram_chat_ids(source):
+            target_chat_id = validate_chat_id(chat_id)
+            if target_chat_id in seen_chat_ids:
+                continue
+            unique_chat_ids.append(target_chat_id)
+            seen_chat_ids.add(target_chat_id)
 
     return unique_chat_ids
 
@@ -9513,6 +10029,7 @@ def collect_unique_enabled_vk_chat_ids() -> list[str]:
                 source_id=source.source_id,
                 url=source.url,
                 chat_id=source.chat_id,
+                telegram_chat_ids=parser_source_telegram_chat_ids(source),
                 vk_chat_ids=source.vk_chat_ids,
                 enabled=source.enabled,
                 telegram_enabled=source.telegram_enabled,
@@ -9547,7 +10064,8 @@ def send_test_message():
 
     try:
         if not is_telegram_delivery_enabled() and not is_vk_delivery_enabled():
-            raise RuntimeError("Отправка в Telegram и VK отключена в настройках парсера")
+            raise RuntimeError(
+                "Отправка в Telegram и VK отключена в настройках парсера")
 
         unique_tg_chat_ids = collect_unique_enabled_chat_ids()
         unique_vk_chat_ids = collect_unique_enabled_vk_chat_ids()
@@ -9576,13 +10094,15 @@ def send_test_message():
             vk_session: Optional[aiohttp.ClientSession] = None
             try:
                 if tg_cfg is not None:
-                    tg_timeout = aiohttp.ClientTimeout(total=tg_cfg.request_timeout_seconds)
+                    tg_timeout = aiohttp.ClientTimeout(
+                        total=tg_cfg.request_timeout_seconds)
                     tg_session = aiohttp.ClientSession(
                         timeout=tg_timeout,
                         trust_env=tg_cfg.use_system_proxy,
                     )
                 if vk_cfg is not None:
-                    vk_timeout = aiohttp.ClientTimeout(total=vk_cfg.request_timeout_seconds)
+                    vk_timeout = aiohttp.ClientTimeout(
+                        total=vk_cfg.request_timeout_seconds)
                     vk_session = aiohttp.ClientSession(
                         timeout=vk_timeout,
                         trust_env=vk_cfg.use_system_proxy,
@@ -9627,7 +10147,8 @@ def send_test_message():
                 if vk_session is not None:
                     await vk_session.close()
 
-        sent_tg_chat_ids, sent_vk_chat_ids, source_errors, message_id = asyncio.run(_send_test())
+        sent_tg_chat_ids, sent_vk_chat_ids, source_errors, message_id = asyncio.run(
+            _send_test())
 
         if not sent_tg_chat_ids and not sent_vk_chat_ids:
             joined = " | ".join(source_errors)
@@ -9661,7 +10182,8 @@ def send_settlement_test():
         state.error = ""
         state.info = ""
 
-    settlement_status = normalize_text(request.form.get("settlement_status", "win")).lower()
+    settlement_status = normalize_text(
+        request.form.get("settlement_status", "win")).lower()
     if settlement_status not in {"win", "lose", "return"}:
         settlement_status = "win"
 
@@ -9688,15 +10210,18 @@ def send_settlement_test():
 
     try:
         if not is_telegram_delivery_enabled():
-            raise RuntimeError("Отправка в Telegram отключена в настройках парсера")
+            raise RuntimeError(
+                "Отправка в Telegram отключена в настройках парсера")
 
         tg_cfg = load_telegram_config()
         unique_chat_ids = collect_unique_enabled_chat_ids()
         if not unique_chat_ids:
-            raise RuntimeError("Нужна хотя бы одна включенная ссылка с chat_id Telegram")
+            raise RuntimeError(
+                "Нужна хотя бы одна включенная ссылка с chat_id Telegram")
 
         async def _send_test() -> tuple[list[str], list[str], Optional[int]]:
-            timeout = aiohttp.ClientTimeout(total=tg_cfg.request_timeout_seconds)
+            timeout = aiohttp.ClientTimeout(
+                total=tg_cfg.request_timeout_seconds)
             async with aiohttp.ClientSession(
                 timeout=timeout,
                 trust_env=tg_cfg.use_system_proxy,
@@ -9731,10 +10256,12 @@ def send_settlement_test():
 
         if not sent_chat_ids:
             joined = " | ".join(source_errors)
-            raise RuntimeError(f"Тест обновления исхода не отправлен: {joined}")
+            raise RuntimeError(
+                f"Тест обновления исхода не отправлен: {joined}")
 
         with state.lock:
-            state.preview = updated_message + f"\nКаналы: {', '.join(sent_chat_ids)}"
+            state.preview = updated_message + \
+                f"\nКаналы: {', '.join(sent_chat_ids)}"
             state.last_message_id = message_id
             state.info = (
                 "Тест обновления исхода отправлен в "
@@ -9742,7 +10269,8 @@ def send_settlement_test():
                 + ", ".join(sent_chat_ids)
             )
             if source_errors:
-                state.error = "Часть каналов недоступна: " + " | ".join(source_errors)
+                state.error = "Часть каналов недоступна: " + \
+                    " | ".join(source_errors)
     except Exception as exc:  # noqa: BLE001
         with state.lock:
             state.error = f"Тест обновления исхода не удался: {exc}"
@@ -9770,7 +10298,8 @@ def blogabet_login_route():
         with state.lock:
             state.info = f"Blogabet login завершен. Storage state сохранен: {storage_state_path}"
     except Exception as exc:  # noqa: BLE001
-        log_blogabet_exception("Blogabet login не выполнен: %s", humanize_parser_error(exc))
+        log_blogabet_exception(
+            "Blogabet login не выполнен: %s", humanize_parser_error(exc))
         with state.lock:
             state.error = f"Blogabet login не выполнен: {humanize_parser_error(exc)}"
 
@@ -9783,7 +10312,8 @@ def blogabet_alias_upsert_route():
         state.error = ""
         state.info = ""
 
-    source_tournament = normalize_text(request.form.get("alias_source_tournament", ""))
+    source_tournament = normalize_text(
+        request.form.get("alias_source_tournament", ""))
     target_league = normalize_text(request.form.get("alias_target_league", ""))
 
     if not source_tournament or not target_league:
@@ -9819,6 +10349,48 @@ def blogabet_alias_upsert_route():
     return redirect(url_for("index"))
 
 
+@app.post("/blogabet-alias-delete")
+def blogabet_alias_delete_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    source_tournament = normalize_text(
+        request.form.get("alias_source_tournament", ""))
+
+    if not source_tournament:
+        with state.lock:
+            state.error = "Нужно указать Tournament для удаления алиаса"
+        return redirect(url_for("index"))
+
+    try:
+        aliases_path = resolve_blogabet_league_aliases_path()
+        payload = load_blogabet_league_aliases_payload(aliases_path)
+        aliases = payload.get("aliases", {})
+        if not isinstance(aliases, dict):
+            aliases = {}
+
+        if source_tournament not in aliases:
+            with state.lock:
+                state.error = f"Алиас для {source_tournament} не найден"
+            return redirect(url_for("index"))
+
+        target_league = aliases.pop(source_tournament)
+        payload["aliases"] = aliases
+        save_blogabet_league_aliases_payload(aliases_path, payload)
+
+        with state.lock:
+            state.info = f"Алиас удален: {source_tournament} -> {target_league}"
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = (
+                "Не удалось удалить алиас лиги Blogabet: "
+                f"{humanize_parser_error(exc)}"
+            )
+
+    return redirect(url_for("index"))
+
+
 @app.post("/blogabet-test-publish")
 def blogabet_test_publish_route():
     with state.lock:
@@ -9837,7 +10409,8 @@ def blogabet_test_publish_route():
     image_url = normalize_text(request.form.get("image_url", ""))
     manual_bet_text = (request.form.get("bet_text", "") or "").strip()
     analysis_text = normalize_text(request.form.get("analysis_text", ""))
-    action = normalize_text(request.form.get("blogabet_action", "find")).lower()
+    action = normalize_text(request.form.get(
+        "blogabet_action", "find")).lower()
     dry_run_requested = normalize_text(request.form.get("dry_run", "")) in {
         "1",
         "on",
@@ -9856,7 +10429,8 @@ def blogabet_test_publish_route():
 
     manual_score = ""
     if manual_score_raw:
-        score_match = re.search(r"(\d{1,2})\s*[:\-]\s*(\d{1,2})", manual_score_raw)
+        score_match = re.search(
+            r"(\d{1,2})\s*[:\-]\s*(\d{1,2})", manual_score_raw)
         if score_match is None:
             with state.lock:
                 state.error = "Current score должен быть в формате 3:0 или 3-0"
@@ -9874,7 +10448,8 @@ def blogabet_test_publish_route():
     image_content_type = "image/jpeg"
     if uploaded_image is not None and normalize_text(uploaded_image.filename):
         image_bytes = uploaded_image.read()
-        image_content_type = normalize_text(uploaded_image.mimetype) or "image/jpeg"
+        image_content_type = normalize_text(
+            uploaded_image.mimetype) or "image/jpeg"
 
     if not manual_bet_text and not image_bytes and not image_url:
         with state.lock:
@@ -9925,7 +10500,8 @@ def blogabet_test_publish_route():
                     manual_match,
                     bet_intent,
                     stake,
-                    analysis_text or build_blogabet_analysis_text(manual_match, bet_intent, ocr_text),
+                    analysis_text or build_blogabet_analysis_text(
+                        manual_match, bet_intent, ocr_text),
                     dry_run=dry_run,
                     diagnostics_context={"test_action": action},
                 )
@@ -9934,11 +10510,14 @@ def blogabet_test_publish_route():
                 await publisher.close()
 
         ocr_source, ocr_text, bet_intent, result = asyncio.run(_run_test())
-        diagnostics_text = BlogabetPublisher.format_diagnostics(result.diagnostics)
-        bet_json = json.dumps(bet_intent.__dict__, ensure_ascii=False, indent=2)
+        diagnostics_text = BlogabetPublisher.format_diagnostics(
+            result.diagnostics)
+        bet_json = json.dumps(bet_intent.__dict__,
+                              ensure_ascii=False, indent=2)
 
         with state.lock:
-            state.blogabet_test_pick_url = normalize_text(result.pick_url or "")
+            state.blogabet_test_pick_url = normalize_text(
+                result.pick_url or "")
             state.blogabet_test_diagnostics = diagnostics_text
             state.blogabet_test_log = (
                 f"Action: {action}\n"
@@ -9963,14 +10542,16 @@ def blogabet_test_publish_route():
         with state.lock:
             state.blogabet_test_screenshot_path = exc.screenshot_path
             state.blogabet_test_html_dump_path = exc.html_dump_path
-            state.blogabet_test_diagnostics = BlogabetPublisher.format_diagnostics(exc.diagnostics)
+            state.blogabet_test_diagnostics = BlogabetPublisher.format_diagnostics(
+                exc.diagnostics)
             state.blogabet_test_log = (
                 f"Step: {exc.step_name}\n"
                 f"Reason: {exc.reason}\n"
             )
             state.error = f"Blogabet test не выполнен: {exc.step_name} | {exc.reason}"
     except OcrError as exc:
-        log_blogabet_exception("Blogabet test OCR error: %s", humanize_parser_error(exc))
+        log_blogabet_exception(
+            "Blogabet test OCR error: %s", humanize_parser_error(exc))
         with state.lock:
             state.error = (
                 "Blogabet test не выполнен: ошибка OCR. "
@@ -9978,7 +10559,8 @@ def blogabet_test_publish_route():
                 "Проверь OCR_SPACE_API_KEY или укажи Bet text для теста без OCR."
             )
     except Exception as exc:  # noqa: BLE001
-        log_blogabet_exception("Blogabet test publish unexpected error: %s", humanize_parser_error(exc))
+        log_blogabet_exception(
+            "Blogabet test publish unexpected error: %s", humanize_parser_error(exc))
         with state.lock:
             state.error = f"Blogabet test не выполнен: {humanize_parser_error(exc)}"
 
@@ -9998,7 +10580,8 @@ def blogabet_test_ocr_route():
     image_content_type = "image/jpeg"
     if uploaded_image is not None and normalize_text(uploaded_image.filename):
         image_bytes = uploaded_image.read()
-        image_content_type = normalize_text(uploaded_image.mimetype) or "image/jpeg"
+        image_content_type = normalize_text(
+            uploaded_image.mimetype) or "image/jpeg"
 
     if not image_url and not image_bytes:
         with state.lock:
@@ -10022,7 +10605,8 @@ def blogabet_test_ocr_route():
             return ocr_text, bet_intent, source
 
         ocr_text, bet_intent, source = asyncio.run(_run_ocr())
-        bet_json = json.dumps(bet_intent.__dict__, ensure_ascii=False, indent=2)
+        bet_json = json.dumps(bet_intent.__dict__,
+                              ensure_ascii=False, indent=2)
         with state.lock:
             state.blogabet_ocr_log = (
                 f"Source: {source}\n"
@@ -10032,11 +10616,13 @@ def blogabet_test_ocr_route():
             )
             state.info = "OCR распознавание выполнено."
     except OcrError as exc:
-        log_blogabet_exception("Blogabet OCR tool error: %s", humanize_parser_error(exc))
+        log_blogabet_exception(
+            "Blogabet OCR tool error: %s", humanize_parser_error(exc))
         with state.lock:
             state.error = f"OCR не выполнен: {humanize_parser_error(exc)}"
     except Exception as exc:  # noqa: BLE001
-        log_blogabet_exception("Blogabet OCR tool unexpected error: %s", humanize_parser_error(exc))
+        log_blogabet_exception(
+            "Blogabet OCR tool unexpected error: %s", humanize_parser_error(exc))
         with state.lock:
             state.error = f"OCR не выполнен: {humanize_parser_error(exc)}"
 
@@ -10113,7 +10699,8 @@ def fetch_vk_chat_ids_route():
         vk_cfg = load_vk_config()
 
         async def _fetch() -> list[dict[str, Any]]:
-            vk_timeout = aiohttp.ClientTimeout(total=vk_cfg.request_timeout_seconds)
+            vk_timeout = aiohttp.ClientTimeout(
+                total=vk_cfg.request_timeout_seconds)
             async with aiohttp.ClientSession(
                 timeout=vk_timeout,
                 trust_env=vk_cfg.use_system_proxy,

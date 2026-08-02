@@ -51,6 +51,7 @@ python3 app.py
 - `APP_LOG_LEVEL` — `DEBUG/INFO/WARNING/ERROR`.
 - `BLOGABET_ADMIN_TG_CHAT_ID` — chat_id для админ-алертов по сбоям Blogabet. Можно несколько через запятую/`;`/перенос строки.
 - `BLOGABET_LEAGUE_ALIASES_PATH` — путь к JSON с ручными алиасами лиг Blogabet (по умолчанию `./blogabet_league_aliases.json`).
+- `BLOGABET_RETRY_DELAY_SECONDS` — задержка повтора failed-публикации Blogabet, минимум `10`, по умолчанию `180`.
 - `MATCH_DATABASE_URL` — URL БД для трекинга матчей.
   - по умолчанию: `sqlite:///parser_matches.db`
   - для PostgreSQL: `postgresql://user:password@host:5432/dbname`
