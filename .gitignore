@@ -44,7 +44,9 @@ pip-wheel-metadata/
 htmlcov/
 
 # Logs / runtime files
+logs/
 *.log
+*.log.*
 *.pid
 *.out
 *.err
