@@ -129,6 +129,14 @@ class SELECTORS:
     LOGIN_SUBMIT_BUTTON = "button[type='submit'], input[type='submit']"
 
 
+# Blogabet с августа 2026 отдаёт 403 Forbidden на User-Agent с "HeadlessChrome"
+# (дефолт headless-Chromium) и на curl-подобные UA. Подменяем UA на обычный Chrome,
+# иначе страница логина приходит пустой ("403 Forbidden") и форма не находится.
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
 _TEAM_LABEL_MARKET_SUFFIXES = ("corners", "corner", "bookings", "booking", "cards", "card")
 _RECOVERABLE_SUBMIT_MARKERS = (
     "odds dropped",
@@ -1124,7 +1132,10 @@ class BlogabetPublisher:
         if self._browser is None:
             self._browser = await self._launch_browser(self._playwright, headless=self.cfg.headless)
 
-        self._context = await self._browser.new_context(storage_state=str(storage_state_path))
+        self._context = await self._browser.new_context(
+            storage_state=str(storage_state_path),
+            user_agent=_BROWSER_USER_AGENT,
+        )
         return self._context
 
     async def ensure_session(self) -> None:
@@ -1167,7 +1178,7 @@ class BlogabetPublisher:
         browser: Optional[AsyncBrowser] = None
         try:
             browser = await self._launch_browser(manual_playwright, headless=headless_login)
-            context = await browser.new_context()
+            context = await browser.new_context(user_agent=_BROWSER_USER_AGENT)
             page = await context.new_page()
             home_url = self._base_origin(self.cfg.login_url) or self._base_origin(self.cfg.upcoming_url)
             await page.goto(home_url, wait_until="domcontentloaded", timeout=60000)
