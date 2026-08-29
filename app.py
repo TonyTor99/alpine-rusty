@@ -183,6 +183,10 @@ BLOGABET_LEAGUE_ALIASES_FORMAT_VERSION = 1
 PARSER_DELIVERY_TELEGRAM_ENABLED_ENV = "PARSER_DELIVERY_TELEGRAM_ENABLED"
 PARSER_DELIVERY_VK_ENABLED_ENV = "PARSER_DELIVERY_VK_ENABLED"
 BLOGABET_RETRY_DELAY_SECONDS_ENV = "BLOGABET_RETRY_DELAY_SECONDS"
+# Плановый релогин alpinbet: сессия иногда протухает, поэтому периодически
+# продлеваем её тем же паролем (TARGET_LOGIN_PASSWORD) прямо в контексте парсера.
+TARGET_RELOGIN_INTERVAL_HOURS_ENV = "TARGET_RELOGIN_INTERVAL_HOURS"
+DEFAULT_TARGET_RELOGIN_INTERVAL_HOURS = 12.0
 
 
 @dataclass
@@ -3981,6 +3985,84 @@ async def ensure_async_authorized(page: AsyncPage, cfg: TargetConfig) -> None:
         raise LoginRequiredError("На странице снова отображается форма логина")
 
 
+def get_target_relogin_interval_seconds() -> float:
+    """Интервал планового релогина alpinbet в секундах (0 = выключено)."""
+    raw = os.getenv(TARGET_RELOGIN_INTERVAL_HOURS_ENV, "").strip()
+    try:
+        hours = float(raw) if raw else DEFAULT_TARGET_RELOGIN_INTERVAL_HOURS
+    except ValueError:
+        hours = DEFAULT_TARGET_RELOGIN_INTERVAL_HOURS
+    if hours <= 0:
+        return 0.0
+    return hours * 3600.0
+
+
+async def async_relogin_target(
+    context: Any,
+    cfg: TargetConfig,
+    password: str,
+) -> bool:
+    """Продлевает сессию alpinbet тем же паролем прямо в контексте парсера.
+
+    Куки обновляются в этом же контексте, поэтому парсеру не нужен рестарт.
+    Возвращает True при успехе (или если сессия уже активна), False — если
+    вход не подтверждён (например, alpinbet запросил 2FA-код).
+    """
+    page = await context.new_page()
+
+    async def _visible(selector: str, timeout_ms: int) -> bool:
+        if not selector:
+            return False
+        try:
+            await page.wait_for_selector(selector, state="visible", timeout=timeout_ms)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    try:
+        await page.goto(cfg.login_url, wait_until="domcontentloaded", timeout=30000)
+
+        if cfg.open_login_selector:
+            try:
+                await page.click(cfg.open_login_selector, timeout=8000)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Если поле пароля не появилось — сессия ещё жива, входить не нужно.
+        if not await _visible(cfg.password_selector, 6000):
+            logger.info(
+                "Плановый релогин alpinbet: форма логина не появилась — сессия уже активна")
+            return True
+
+        if cfg.email_selector and cfg.login_username and await _visible(cfg.email_selector, 3000):
+            try:
+                await page.fill(cfg.email_selector, cfg.login_username, timeout=8000)
+            except Exception:  # noqa: BLE001
+                pass
+
+        await page.fill(cfg.password_selector, password, timeout=8000)
+        await page.click(cfg.submit_selector, timeout=8000)
+        await page.wait_for_timeout(1500)
+
+        if cfg.code_selector and await _visible(cfg.code_selector, 3000):
+            logger.warning(
+                "Плановый релогин alpinbet требует 2FA-код — пропускаю, нужен ручной вход через панель")
+            return False
+
+        if await is_async_login_form_visible(page, cfg.login_form_selector):
+            logger.warning(
+                "Плановый релогин alpinbet: форма логина всё ещё активна после отправки — вход не подтверждён")
+            return False
+
+        logger.info("Плановый релогин alpinbet выполнен — сессия продлена")
+        return True
+    finally:
+        try:
+            await page.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def click_active_tab(page: AsyncPage) -> None:
     try:
         active_now = page.locator(
@@ -6973,6 +7055,18 @@ async def parser_worker_async(
                         trust_env=vk_cfg.use_system_proxy,
                     )
 
+                target_relogin_interval = get_target_relogin_interval_seconds()
+                next_target_relogin_at = (
+                    time.monotonic() + target_relogin_interval
+                    if target_relogin_interval > 0
+                    else 0.0
+                )
+                if target_relogin_interval > 0:
+                    logger.info(
+                        "Плановый релогин alpinbet включён: каждые %.1f ч",
+                        target_relogin_interval / 3600.0,
+                    )
+
                 while not stop_event.is_set():
                     cycle_started_at = time.monotonic()
                     interval_seconds = max(cfg.parser_interval_seconds, 10)
@@ -6989,6 +7083,32 @@ async def parser_worker_async(
                         if parser_context is None:
                             raise RuntimeError(
                                 "Сессия парсера не инициализирована")
+
+                        # Плановый релогин alpinbet: продлеваем сессию тем же
+                        # паролем, чтобы куки не протухали. Ошибка не роняет цикл.
+                        if (
+                            target_relogin_interval > 0
+                            and time.monotonic() >= next_target_relogin_at
+                        ):
+                            relogin_password = (
+                                os.getenv("TARGET_LOGIN_PASSWORD", "")
+                                or cfg.login_password
+                                or ""
+                            ).strip()
+                            if relogin_password:
+                                try:
+                                    await async_relogin_target(
+                                        parser_context, cfg, relogin_password)
+                                except Exception as relogin_exc:  # noqa: BLE001
+                                    logger.warning(
+                                        "Плановый релогин alpinbet не удался: %s",
+                                        relogin_exc,
+                                    )
+                            else:
+                                logger.info(
+                                    "Плановый релогин alpinbet пропущен: пароль не задан (TARGET_LOGIN_PASSWORD)")
+                            next_target_relogin_at = (
+                                time.monotonic() + target_relogin_interval)
 
                         due_blogabet_retries = pop_due_blogabet_retries(
                             blogabet_retry_queue,
